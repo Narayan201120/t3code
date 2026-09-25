@@ -70,6 +70,7 @@ const OpenCodeRuntimeTestDouble: OpenCodeRuntime.OpenCodeRuntimeShape = {
           ? { serverPassword: effectiveServerPassword }
           : {}),
         version: "1.14.19",
+        apiVersion: "v1" as const,
         isRunning: Effect.succeed(true),
         exitCode: Effect.never,
       };
@@ -87,6 +88,7 @@ const OpenCodeRuntimeTestDouble: OpenCodeRuntime.OpenCodeRuntimeShape = {
           url: serverUrl ?? "http://127.0.0.1:4301",
           ...(serverPassword ? { serverPassword } : {}),
           version: "1.14.19",
+          apiVersion: "v1" as const,
           exitCode: null,
           external: Boolean(serverUrl),
         }),
@@ -133,6 +135,16 @@ const OpenCodeRuntimeTestDouble: OpenCodeRuntime.OpenCodeRuntimeShape = {
       new OpenCodeRuntime.OpenCodeRuntimeError({
         operation: "loadOpenCodeInventory",
         detail: "OpenCodeRuntimeTestDouble.loadOpenCodeInventory not used in this test",
+        cause: null,
+      }),
+    ),
+  createOpenCodeV2Client: () =>
+    ({}) as unknown as ReturnType<OpenCodeRuntime.OpenCodeRuntimeShape["createOpenCodeV2Client"]>,
+  loadOpenCodeInventoryV2: () =>
+    Effect.fail(
+      new OpenCodeRuntime.OpenCodeRuntimeError({
+        operation: "loadOpenCodeInventoryV2",
+        detail: "OpenCodeRuntimeTestDouble.loadOpenCodeInventoryV2 not used in this test",
         cause: null,
       }),
     ),

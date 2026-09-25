@@ -2,6 +2,7 @@ import * as NodeAssert from "node:assert/strict";
 
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { createOpencodeClient, type OpencodeClient } from "@opencode-ai/sdk/v2";
+import { OpenCode } from "@opencode/client";
 import { it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
@@ -56,6 +57,110 @@ it.layer(testLayer)("OpenCodeRuntime inventory", (it) => {
         "/provider",
         "/skill",
       ]);
+    }),
+  );
+
+  it.effect("aborts the v2 models gate when inventory loading is interrupted", () =>
+    Effect.gen(function* () {
+      const runtime = yield* OpenCodeRuntime;
+      const started = yield* Queue.make<string>();
+      const aborted = yield* Queue.make<string>();
+      const client = OpenCode.make({
+        baseUrl: "http://opencode.test",
+        fetch: Object.assign(
+          (input: string | Request | URL, init?: RequestInit) => {
+            const request = input instanceof Request ? input : new Request(input.toString());
+            const pathname = new URL(request.url).pathname;
+            // The v2 client calls fetch(url, init); the abort signal lives
+            // on init, so a stub that only watches request.signal would never
+            // observe interruption.
+            const signal = init?.signal ?? request.signal;
+            return new Promise<Response>((_resolve, reject) => {
+              signal.addEventListener(
+                "abort",
+                () => {
+                  Queue.offerUnsafe(aborted, pathname);
+                  reject(signal.reason);
+                },
+                { once: true },
+              );
+              Queue.offerUnsafe(started, pathname);
+            });
+          },
+          { preconnect: () => undefined },
+        ),
+      });
+
+      const inventoryFiber = yield* runtime
+        .loadOpenCodeInventoryV2(client, "/workspace/project")
+        .pipe(Effect.forkChild);
+      // The models call gates the rest: nothing else can be in flight yet,
+      // so the first offer is deterministically the models request.
+      yield* Queue.takeN(started, 1);
+      yield* Fiber.interrupt(inventoryFiber);
+
+      NodeAssert.deepEqual(yield* Queue.takeAll(aborted), ["/api/model"]);
+    }),
+  );
+
+  it.effect("aborts trailing v2 requests when inventory loading is interrupted", () =>
+    Effect.gen(function* () {
+      const runtime = yield* OpenCodeRuntime;
+      const started = yield* Queue.make<string>();
+      const aborted = yield* Queue.make<string>();
+      // Models resolve only once the test releases them, so the trailing
+      // calls cannot start early and takeN observes a deterministic order.
+      let releaseModels: () => void = () => undefined;
+      const modelsGate = new Promise<void>((resolve) => {
+        releaseModels = () => resolve(undefined);
+      });
+      const client = OpenCode.make({
+        baseUrl: "http://opencode.test",
+        fetch: Object.assign(
+          (input: string | Request | URL, init?: RequestInit) => {
+            const request = input instanceof Request ? input : new Request(input.toString());
+            const pathname = new URL(request.url).pathname;
+            const signal = init?.signal ?? request.signal;
+            if (pathname === "/api/model") {
+              Queue.offerUnsafe(started, pathname);
+              return modelsGate.then(() =>
+                Response.json({
+                  location: {},
+                  data: [{ providerID: "openai", modelID: "gpt-5", name: "GPT-5", variants: [] }],
+                }),
+              );
+            }
+            return new Promise<Response>((_resolve, reject) => {
+              signal.addEventListener(
+                "abort",
+                () => {
+                  Queue.offerUnsafe(aborted, pathname);
+                  reject(signal.reason);
+                },
+                { once: true },
+              );
+              Queue.offerUnsafe(started, pathname);
+            });
+          },
+          { preconnect: () => undefined },
+        ),
+      });
+
+      const inventoryFiber = yield* runtime
+        .loadOpenCodeInventoryV2(client, "/workspace/project")
+        .pipe(Effect.forkChild);
+      // Only the models gate can be in flight before the release.
+      yield* Queue.takeN(started, 1);
+      releaseModels();
+      // The release lets the loader fire the remaining four calls together,
+      // the same burst the v1 abort test relies on.
+      yield* Queue.takeN(started, 4);
+      yield* Fiber.interrupt(inventoryFiber);
+
+      const aborts = yield* Queue.takeAll(aborted);
+      for (const pathname of ["/api/agent", "/api/command", "/api/provider", "/api/skill"]) {
+        NodeAssert.ok(aborts.includes(pathname), `missing abort for ${pathname}`);
+      }
     }),
   );
 

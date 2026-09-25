@@ -48,6 +48,7 @@ const makeRuntime = Effect.gen(function* () {
         return {
           url: `http://127.0.0.1:${index}`,
           version: "1.14.19",
+          apiVersion: "v1" as const,
           isRunning: Effect.succeed(true),
           exitCode: Effect.never,
         };
@@ -55,7 +56,9 @@ const makeRuntime = Effect.gen(function* () {
     connectToOpenCodeServer: unusedRuntimeMethod,
     runOpenCodeCommand: unusedRuntimeMethod,
     createOpenCodeSdkClient: () => ({}) as never,
+    createOpenCodeV2Client: () => ({}) as never,
     loadOpenCodeInventory: unusedRuntimeMethod,
+    loadOpenCodeInventoryV2: unusedRuntimeMethod,
     loadOpenCodeSkills: unusedRuntimeMethod,
     loadInventoryFromCli: unusedRuntimeMethod,
     loadSkillsFromCli: unusedRuntimeMethod,
@@ -131,6 +134,7 @@ it.effect("invalidates an exited process so the next borrower starts a new one",
           return {
             url: `http://127.0.0.1:${index}`,
             version: "1.14.19",
+            apiVersion: "v1" as const,
             isRunning: Effect.succeed(true),
             exitCode: Deferred.await(exitCode),
           };
@@ -138,7 +142,9 @@ it.effect("invalidates an exited process so the next borrower starts a new one",
       connectToOpenCodeServer: unusedRuntimeMethod,
       runOpenCodeCommand: unusedRuntimeMethod,
       createOpenCodeSdkClient: () => ({}) as never,
+      createOpenCodeV2Client: () => ({}) as never,
       loadOpenCodeInventory: unusedRuntimeMethod,
+      loadOpenCodeInventoryV2: unusedRuntimeMethod,
       loadOpenCodeSkills: unusedRuntimeMethod,
       loadInventoryFromCli: unusedRuntimeMethod,
       loadSkillsFromCli: unusedRuntimeMethod,
@@ -179,6 +185,7 @@ it.effect("replaces a dead cached process before its exit watcher runs", () =>
           return {
             url: `http://127.0.0.1:${index}`,
             version: "1.14.19",
+            apiVersion: "v1" as const,
             isRunning: Ref.get(isRunning),
             exitCode: Effect.never,
           };
@@ -186,7 +193,9 @@ it.effect("replaces a dead cached process before its exit watcher runs", () =>
       connectToOpenCodeServer: unusedRuntimeMethod,
       runOpenCodeCommand: unusedRuntimeMethod,
       createOpenCodeSdkClient: () => ({}) as never,
+      createOpenCodeV2Client: () => ({}) as never,
       loadOpenCodeInventory: unusedRuntimeMethod,
+      loadOpenCodeInventoryV2: unusedRuntimeMethod,
       loadOpenCodeSkills: unusedRuntimeMethod,
       loadInventoryFromCli: unusedRuntimeMethod,
       loadSkillsFromCli: unusedRuntimeMethod,
@@ -234,6 +243,7 @@ it.effect("cleans up an interrupted startup and allows a retry", () =>
           return {
             url: `http://127.0.0.1:${index}`,
             version: "1.14.19",
+            apiVersion: "v1" as const,
             isRunning: Effect.succeed(true),
             exitCode: Effect.never,
           };
@@ -241,7 +251,9 @@ it.effect("cleans up an interrupted startup and allows a retry", () =>
       connectToOpenCodeServer: unusedRuntimeMethod,
       runOpenCodeCommand: unusedRuntimeMethod,
       createOpenCodeSdkClient: () => ({}) as never,
+      createOpenCodeV2Client: () => ({}) as never,
       loadOpenCodeInventory: unusedRuntimeMethod,
+      loadOpenCodeInventoryV2: unusedRuntimeMethod,
       loadOpenCodeSkills: unusedRuntimeMethod,
       loadInventoryFromCli: unusedRuntimeMethod,
       loadSkillsFromCli: unusedRuntimeMethod,

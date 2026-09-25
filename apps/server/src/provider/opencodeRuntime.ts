@@ -13,6 +13,7 @@ import {
   type QuestionAnswer,
   type QuestionRequest,
 } from "@opencode-ai/sdk/v2";
+import { OpenCode as OpenCodeV2, type OpenCodeClient as OpenCodeV2Client } from "@opencode/client";
 import * as Cause from "effect/Cause";
 import * as Context from "effect/Context";
 import * as Data from "effect/Data";
@@ -78,15 +79,19 @@ export function resolveOpenCodeServerPassword(
     : input.environment.OPENCODE_SERVER_PASSWORD;
 }
 
-const OPENCODE_SERVER_READY_PREFIX = "opencode server listening";
+const OPENCODE_SERVER_READY_PREFIXES = ["opencode server listening", "server listening"] as const;
+const OPENCODE_SERVER_PASSWORD_PREFIX = "server password";
 const DEFAULT_OPENCODE_SERVER_TIMEOUT_MS = 30_000;
 const DEFAULT_HOSTNAME = "127.0.0.1";
 const OPENCODE_SERVER_STARTUP_MAX_OUTPUT_CHARS = 64 * 1024;
 const OPENCODE_SKILL_DISCOVERY_MAX_OUTPUT_BYTES = 8 * 1024 * 1024;
+export type OpenCodeApiVersion = "v1" | "v2";
+
 export interface OpenCodeServerProcess {
   readonly url: string;
   readonly serverPassword?: string;
   readonly version: string;
+  readonly apiVersion: OpenCodeApiVersion;
   readonly isRunning: Effect.Effect<boolean>;
   readonly exitCode: Effect.Effect<number, never>;
 }
@@ -95,6 +100,7 @@ export interface OpenCodeServerConnection {
   readonly url: string;
   readonly serverPassword?: string;
   readonly version: string;
+  readonly apiVersion: OpenCodeApiVersion;
   readonly exitCode: Effect.Effect<number, never> | null;
   readonly external: boolean;
 }
@@ -177,6 +183,80 @@ export const verifyOpenCodeServerVersion = Effect.fn("verifyOpenCodeServerVersio
   }
   return health.version;
 });
+
+export const verifyOpenCodeServerVersionV2 = Effect.fn("verifyOpenCodeServerVersionV2")(function* (
+  client: OpenCodeV2Client,
+) {
+  const infoOption = yield* runOpenCodeSdk("server.info", (signal) =>
+    client.server.info({ signal }),
+  ).pipe(Effect.timeoutOption(OPENCODE_HEALTH_TIMEOUT));
+  if (Option.isNone(infoOption)) {
+    return yield* new OpenCodeRuntimeError({
+      operation: "server.info",
+      detail: "Timed out while checking the OpenCode server version.",
+    });
+  }
+
+  const version = infoOption.value.version;
+  if (typeof version !== "string" || parseSemver(version) === null) {
+    return yield* new OpenCodeRuntimeError({
+      operation: "server.info",
+      detail: `OpenCode server returned an invalid version. T3 Code requires OpenCode v${MINIMUM_OPENCODE_VERSION} or newer.`,
+    });
+  }
+  if (compareSemverVersions(version, MINIMUM_OPENCODE_VERSION) < 0) {
+    return yield* new OpenCodeRuntimeError({
+      operation: "server.info",
+      detail: `OpenCode v${version} is too old. Upgrade to v${MINIMUM_OPENCODE_VERSION} or newer.`,
+    });
+  }
+  return version;
+});
+
+// A v1 client pointed at a v2 server fails with "not supported" (the old
+// routes serve the web UI as text/html). Only that incompatibility signal
+// falls through to the v2 API; every other v1 failure (auth, refused,
+// timeout) propagates unchanged so real problems keep their diagnosis.
+const OPENCODE_V1_INCOMPATIBLE_RE = /not supported|text\/html/i;
+
+export const detectOpenCodeServerApi = Effect.fn("detectOpenCodeServerApi")(function* (
+  v1client: OpencodeClient,
+  v2client: OpenCodeV2Client,
+) {
+  const v1Exit = yield* Effect.exit(verifyOpenCodeServerVersion(v1client));
+  if (v1Exit._tag === "Success") {
+    return { version: v1Exit.value, apiVersion: "v1" as const };
+  }
+  if (!OPENCODE_V1_INCOMPATIBLE_RE.test(openCodeRuntimeErrorDetail(Cause.squash(v1Exit.cause)))) {
+    return yield* Effect.failCause(v1Exit.cause);
+  }
+  const version = yield* verifyOpenCodeServerVersionV2(v2client);
+  return { version, apiVersion: "v2" as const };
+});
+
+export interface OpenCodeV2InventoryModel {
+  readonly providerID: string;
+  readonly modelID: string;
+  readonly name: string;
+  readonly variantIDs: ReadonlyArray<string>;
+}
+
+export interface OpenCodeV2Inventory {
+  readonly providers: ReadonlyArray<{ readonly id: string; readonly name: string }>;
+  readonly connectedProviders: ReadonlyArray<string>;
+  readonly models: ReadonlyArray<OpenCodeV2InventoryModel>;
+  readonly agents: ReadonlyArray<{
+    readonly name: string;
+    readonly mode: string;
+    readonly hidden: boolean;
+  }>;
+  readonly skills: ReadonlyArray<{
+    readonly name: string;
+    readonly description?: string;
+    readonly location: string;
+  }>;
+  readonly commands: ReadonlyArray<{ readonly name: string; readonly description?: string }>;
+}
 
 export interface OpenCodeCommandResult {
   readonly stdout: string;
@@ -269,9 +349,17 @@ export interface OpenCodeRuntimeShape {
     readonly directory: string;
     readonly serverPassword?: string;
   }) => OpencodeClient;
+  readonly createOpenCodeV2Client: (input: {
+    readonly baseUrl: string;
+    readonly serverPassword?: string;
+  }) => OpenCodeV2Client;
   readonly loadOpenCodeInventory: (
     client: OpencodeClient,
   ) => Effect.Effect<OpenCodeInventory, OpenCodeRuntimeError>;
+  readonly loadOpenCodeInventoryV2: (
+    client: OpenCodeV2Client,
+    directory: string,
+  ) => Effect.Effect<OpenCodeV2Inventory, OpenCodeRuntimeError>;
   readonly loadOpenCodeSkills: (
     client: OpencodeClient,
   ) => Effect.Effect<ReadonlyArray<OpenCodeSkill>, OpenCodeRuntimeError>;
@@ -287,15 +375,34 @@ export interface OpenCodeRuntimeShape {
   }) => Effect.Effect<ReadonlyArray<OpenCodeSkill>, OpenCodeRuntimeError>;
 }
 
-function parseServerUrlFromOutput(output: string): string | null {
+/** @internal */
+export function parseServerUrlFromOutput(output: string): string | null {
   for (const line of output.split("\n")) {
-    if (!line.startsWith(OPENCODE_SERVER_READY_PREFIX)) {
+    const trimmed = line.trimStart();
+    if (!OPENCODE_SERVER_READY_PREFIXES.some((prefix) => trimmed.startsWith(prefix))) {
       continue;
     }
     const match = line.match(/on\s+(https?:\/\/[^\s]+)/);
     return match?.[1] ?? null;
   }
   return null;
+}
+
+/** @internal */
+export function parseServerPasswordFromOutput(output: string): string | undefined {
+  for (const line of output.split("\n")) {
+    const trimmed = line.trimStart();
+    if (!trimmed.startsWith(OPENCODE_SERVER_PASSWORD_PREFIX)) {
+      continue;
+    }
+    const password = trimmed
+      .slice(OPENCODE_SERVER_PASSWORD_PREFIX.length)
+      .trim()
+      .replace(/^[:=]\s*/, "")
+      .trim();
+    return password.length > 0 ? password : undefined;
+  }
+  return undefined;
 }
 
 const SLUG_LINE_RE = /^(\S+\/\S+)\s*$/;
@@ -747,22 +854,41 @@ const makeOpenCodeRuntime = Effect.gen(function* () {
       const stdoutRef = yield* Ref.make<string | null>("");
       const stderrRef = yield* Ref.make<string | null>("");
       const readyDeferred = yield* Deferred.make<string, OpenCodeRuntimeError>();
+      const printedPasswordRef = yield* Ref.make<string | undefined>(undefined);
+      const passwordDeferred = yield* Deferred.make<string, never>();
+      // Separate rolling window for the password line. It must survive the
+      // post-ready drain (when stdoutRef is nulled) because 2.x prints
+      // `server password ...` after `server listening on ...`, often in a
+      // later chunk, and split lines must still match.
+      const passwordScanRef = yield* Ref.make("");
 
       const setReadyFromStdoutChunk = (chunk: string) =>
-        Ref.modify(stdoutRef, (stdout) => {
-          if (stdout === null) {
-            return [null, null] as const;
+        Effect.gen(function* () {
+          const chunkPassword = yield* Ref.modify(passwordScanRef, (previous) => {
+            const next = `${previous}${chunk}`.slice(-512);
+            return [parseServerPasswordFromOutput(next), next] as const;
+          });
+          if (chunkPassword !== undefined) {
+            const already = yield* Ref.get(printedPasswordRef);
+            if (already === undefined) {
+              yield* Ref.set(printedPasswordRef, chunkPassword);
+              yield* Deferred.succeed(passwordDeferred, chunkPassword).pipe(Effect.ignore);
+            }
           }
-          const nextStdout = `${stdout}${chunk}`;
-          return [
-            parseServerUrlFromOutput(nextStdout),
-            nextStdout.slice(-OPENCODE_SERVER_STARTUP_MAX_OUTPUT_CHARS),
-          ] as const;
-        }).pipe(
-          Effect.flatMap((parsed) =>
-            parsed ? Deferred.succeed(readyDeferred, parsed).pipe(Effect.ignore) : Effect.void,
-          ),
-        );
+          const parsedUrl = yield* Ref.modify(stdoutRef, (stdout) => {
+            if (stdout === null) {
+              return [null, null] as const;
+            }
+            const nextStdout = `${stdout}${chunk}`;
+            return [
+              parseServerUrlFromOutput(nextStdout),
+              nextStdout.slice(-OPENCODE_SERVER_STARTUP_MAX_OUTPUT_CHARS),
+            ] as const;
+          });
+          if (parsedUrl !== null) {
+            yield* Deferred.succeed(readyDeferred, parsedUrl).pipe(Effect.ignore);
+          }
+        });
 
       const stdoutFiber = yield* child.stdout.pipe(
         Stream.decodeText(),
@@ -828,9 +954,17 @@ const makeOpenCodeRuntime = Effect.gen(function* () {
 
       const readyOption = readyExit.value;
       if (Option.isNone(readyOption)) {
+        const stdout = ((yield* Ref.get(stdoutRef)) ?? "").trim().slice(-2000);
+        const stderr = ((yield* Ref.get(stderrRef)) ?? "").trim().slice(-2000);
         return yield* new OpenCodeRuntimeError({
           operation: "startOpenCodeServerProcess",
-          detail: `Timed out waiting for OpenCode server start after ${timeoutMs}ms.`,
+          detail: [
+            `Timed out waiting for OpenCode server start after ${timeoutMs}ms.`,
+            stdout ? `stdout:\n${stdout}` : null,
+            stderr ? `stderr:\n${stderr}` : null,
+          ]
+            .filter(Boolean)
+            .join("\n\n"),
         });
       }
 
@@ -841,18 +975,33 @@ const makeOpenCodeRuntime = Effect.gen(function* () {
       yield* Ref.set(stderrRef, null);
 
       const url = readyOption.value;
-      const version = yield* verifyOpenCodeServerVersion(
-        createOpenCodeSdkClient({
+      // OpenCode 2.x prints `server listening on ...` followed by
+      // `server password ...` when no password was configured. The password
+      // can arrive in a later chunk than the URL, so allow a brief window
+      // for it before falling back to the configured password.
+      if (serverPassword === undefined) {
+        yield* Deferred.await(passwordDeferred).pipe(Effect.timeoutOption(500));
+      }
+      const printedPassword = yield* Ref.get(printedPasswordRef);
+      const effectivePassword = printedPassword ?? serverPassword;
+      const v1client = createOpenCodeSdkClient({
+        baseUrl: url,
+        directory: input.directory,
+        ...(effectivePassword !== undefined ? { serverPassword: effectivePassword } : {}),
+      });
+      const { version, apiVersion } = yield* detectOpenCodeServerApi(
+        v1client,
+        createOpenCodeV2Client({
           baseUrl: url,
-          directory: input.directory,
-          ...(serverPassword !== undefined ? { serverPassword } : {}),
+          ...(effectivePassword !== undefined ? { serverPassword: effectivePassword } : {}),
         }),
       );
 
       return {
         url,
-        ...(serverPassword !== undefined ? { serverPassword } : {}),
+        ...(effectivePassword !== undefined ? { serverPassword: effectivePassword } : {}),
         version,
+        apiVersion,
         isRunning: child.isRunning.pipe(Effect.orElseSucceed(() => false)),
         exitCode: child.exitCode.pipe(
           Effect.map(Number),
@@ -868,17 +1017,22 @@ const makeOpenCodeRuntime = Effect.gen(function* () {
         external: true,
         ...(input.serverPassword !== undefined ? { serverPassword: input.serverPassword } : {}),
       });
-      return verifyOpenCodeServerVersion(
+      return detectOpenCodeServerApi(
         createOpenCodeSdkClient({
           baseUrl: serverUrl,
           directory: input.directory,
           ...(serverPassword !== undefined ? { serverPassword } : {}),
         }),
+        createOpenCodeV2Client({
+          baseUrl: serverUrl,
+          ...(serverPassword !== undefined ? { serverPassword } : {}),
+        }),
       ).pipe(
-        Effect.map((version) => ({
+        Effect.map(({ version, apiVersion }) => ({
           url: serverUrl,
           ...(serverPassword !== undefined ? { serverPassword } : {}),
           version,
+          apiVersion,
           exitCode: null,
           external: true,
         })),
@@ -898,11 +1052,24 @@ const makeOpenCodeRuntime = Effect.gen(function* () {
         url: server.url,
         ...(server.serverPassword !== undefined ? { serverPassword: server.serverPassword } : {}),
         version: server.version,
+        apiVersion: server.apiVersion,
         exitCode: server.exitCode,
         external: false,
       })),
     );
   };
+
+  const createOpenCodeV2Client: OpenCodeRuntimeShape["createOpenCodeV2Client"] = (input) =>
+    OpenCodeV2.make({
+      baseUrl: input.baseUrl,
+      ...(input.serverPassword
+        ? {
+            headers: {
+              Authorization: `Basic ${Buffer.from(`opencode:${input.serverPassword}`, "utf8").toString("base64")}`,
+            },
+          }
+        : {}),
+    });
 
   const loadProviders = (client: OpencodeClient) =>
     runOpenCodeSdk("provider.list", (signal) => client.provider.list(undefined, { signal })).pipe(
@@ -958,6 +1125,85 @@ const makeOpenCodeRuntime = Effect.gen(function* () {
         commands,
       })),
     );
+
+  // OpenCode 2.x moved the API under /api with new envelopes. Only the
+  // provider-status path speaks v2 so far; live sessions still use the v1
+  // SDK and need their own migration before they work against 2.x servers.
+  const loadOpenCodeInventoryV2: OpenCodeRuntimeShape["loadOpenCodeInventoryV2"] = (
+    client,
+    directory,
+  ) =>
+    Effect.gen(function* () {
+      const location = { location: { directory } };
+      // A freshly spawned 2.x server answers list calls with empty catalogs
+      // for a few seconds after printing its ready banner (measured 4-8s
+      // locally: 0 models, then the full registry). An empty model catalog
+      // therefore means "still warming up", never "no models exist", so wait
+      // for models first, then load the remaining lists together.
+      const models = yield* Effect.gen(function* () {
+        for (let attempt = 0; ; attempt += 1) {
+          const fetched = yield* runOpenCodeSdk("model.list", (signal) =>
+            client.model.list(location, { signal }),
+          ).pipe(Effect.map((result) => result.data));
+          if (fetched.length > 0 || attempt >= 4) {
+            return fetched;
+          }
+          yield* Effect.sleep("2 seconds");
+        }
+      });
+      const [providers, agents, skills, commands] = yield* Effect.all(
+        [
+          runOpenCodeSdk("provider.list", (signal) =>
+            client.provider.list(location, { signal }),
+          ).pipe(Effect.map((result) => result.data)),
+          runOpenCodeSdk("agent.list", (signal) => client.agent.list(location, { signal })).pipe(
+            Effect.map((result) =>
+              result.data.map((agent) => ({
+                name: agent.name,
+                mode: agent.mode,
+                hidden: agent.hidden,
+              })),
+            ),
+            Effect.orElseSucceed((): OpenCodeV2Inventory["agents"] => []),
+          ),
+          runOpenCodeSdk("skill.list", (signal) => client.skill.list(location, { signal })).pipe(
+            Effect.map((result) =>
+              result.data.map((skill) => ({
+                name: skill.name,
+                ...(skill.description === undefined ? {} : { description: skill.description }),
+                location: skill.path,
+              })),
+            ),
+            Effect.orElseSucceed((): OpenCodeV2Inventory["skills"] => []),
+          ),
+          runOpenCodeSdk("command.list", (signal) =>
+            client.command.list(location, { signal }),
+          ).pipe(
+            Effect.map((result) =>
+              result.data.map((command) => ({
+                name: command.name,
+                ...(command.description === undefined ? {} : { description: command.description }),
+              })),
+            ),
+            Effect.orElseSucceed((): OpenCodeV2Inventory["commands"] => []),
+          ),
+        ],
+        { concurrency: "unbounded" },
+      );
+      return {
+        providers: providers.map((provider) => ({ id: provider.id, name: provider.name })),
+        connectedProviders: providers.map((provider) => provider.id),
+        models: models.map((model) => ({
+          providerID: model.providerID,
+          modelID: model.modelID,
+          name: model.name,
+          variantIDs: (model.variants ?? []).map((variant) => variant.id),
+        })),
+        agents,
+        skills,
+        commands,
+      };
+    });
 
   const loadInventoryFromCli: OpenCodeRuntimeShape["loadInventoryFromCli"] = (input) =>
     Effect.gen(function* () {
@@ -1084,7 +1330,9 @@ const makeOpenCodeRuntime = Effect.gen(function* () {
     connectToOpenCodeServer,
     runOpenCodeCommand,
     createOpenCodeSdkClient,
+    createOpenCodeV2Client,
     loadOpenCodeInventory,
+    loadOpenCodeInventoryV2,
     loadOpenCodeSkills,
     loadInventoryFromCli,
     loadSkillsFromCli,

@@ -3,14 +3,16 @@
 Install and authenticate OpenCode on the machine running your environment, then
 enable it in **Settings > Providers**. See [provider setup](./install.md#providers).
 T3 Code requires OpenCode 1.14.19 or newer, including when you connect an existing
-OpenCode server.
+OpenCode server. OpenCode 2.x is supported for provider status, models, skills,
+and commands; live agentic sessions against a 2.x server are not yet supported.
 
 ## Local or external server
 
 Leave **Server URL** empty to let T3 Code start OpenCode locally. A password in
 provider settings applies to both that server and T3 Code's connection. With no
 password setting, the local server uses `OPENCODE_SERVER_PASSWORD` from its
-environment.
+environment. OpenCode 2.x prints a generated `server password` on startup when
+none is configured; T3 Code picks that up automatically.
 
 To use an existing OpenCode server, set **Server URL** and its password in provider
 settings. T3 Code uses only that configured password for an external server; it

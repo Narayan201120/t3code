@@ -5,6 +5,8 @@ import { describe, it } from "vite-plus/test";
 import {
   parseAgentListCliOutput,
   parseModelsCliOutput,
+  parseServerPasswordFromOutput,
+  parseServerUrlFromOutput,
   parseSkillsCliOutput,
   toOpenCodeFileParts,
 } from "./opencodeRuntime.ts";
@@ -331,5 +333,43 @@ describe("toOpenCodeFileParts", () => {
     });
 
     NodeAssert.deepEqual(parts, []);
+  });
+});
+
+describe("parseServerUrlFromOutput", () => {
+  it("parses the v1 ready banner", () => {
+    NodeAssert.equal(
+      parseServerUrlFromOutput("opencode server listening on http://127.0.0.1:4096\n"),
+      "http://127.0.0.1:4096",
+    );
+  });
+
+  it("parses the v2 ready banner without the opencode prefix", () => {
+    NodeAssert.equal(
+      parseServerUrlFromOutput("server listening on http://127.0.0.1:4099\n"),
+      "http://127.0.0.1:4099",
+    );
+  });
+
+  it("ignores unrelated startup lines", () => {
+    NodeAssert.equal(parseServerUrlFromOutput("starting up\nloading config\n"), null);
+  });
+});
+
+describe("parseServerPasswordFromOutput", () => {
+  it("extracts the printed v2 server password", () => {
+    NodeAssert.equal(
+      parseServerPasswordFromOutput(
+        "server listening on http://127.0.0.1:4099\nserver password secret-123\n",
+      ),
+      "secret-123",
+    );
+  });
+
+  it("returns undefined when no password line is present", () => {
+    NodeAssert.equal(
+      parseServerPasswordFromOutput("opencode server listening on http://127.0.0.1:4096\n"),
+      undefined,
+    );
   });
 });

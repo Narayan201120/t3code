@@ -24,7 +24,11 @@ import {
   checkOpenCodeProviderStatus,
   openCodeCommandsToServerProviderSlashCommands,
 } from "./OpenCodeProvider.ts";
-import type { OpenCodeInventory } from "../opencodeRuntime.ts";
+import type {
+  OpenCodeApiVersion,
+  OpenCodeInventory,
+  OpenCodeV2Inventory,
+} from "../opencodeRuntime.ts";
 import { readOpenCodeGoUsageLimits } from "./openCodeUsageLimits.ts";
 const decodeOpenCodeSettings = Schema.decodeSync(OpenCodeSettings);
 
@@ -167,6 +171,9 @@ const runtimeMock = {
       directory: string;
       serverPassword?: string;
     }>,
+    v2ClientInputs: [] as Array<{ baseUrl: string; serverPassword?: string }>,
+    apiVersion: "v1" as OpenCodeApiVersion,
+    inventoryV2: null as OpenCodeV2Inventory | null,
     inventory: {
       providerList: { connected: [] as string[], all: [] as unknown[], default: {} },
       agents: [] as unknown[],
@@ -182,6 +189,9 @@ const runtimeMock = {
     this.state.inventoryCwd = null;
     this.state.closeCalls = 0;
     this.state.sdkClientInputs.length = 0;
+    this.state.v2ClientInputs.length = 0;
+    this.state.apiVersion = "v1";
+    this.state.inventoryV2 = null;
     this.state.inventory = {
       providerList: { connected: [], all: [] as unknown[], default: {} },
       agents: [] as unknown[],
@@ -209,6 +219,7 @@ const OpenCodeRuntimeTestDouble: OpenCodeRuntimeShape = {
           ? { serverPassword: effectiveServerPassword }
           : {}),
         version: "1.14.19",
+        apiVersion: runtimeMock.state.apiVersion,
         isRunning: Effect.succeed(true),
         exitCode: Effect.never,
       };
@@ -233,6 +244,7 @@ const OpenCodeRuntimeTestDouble: OpenCodeRuntimeShape = {
         url: serverUrl ?? "http://127.0.0.1:4301",
         ...(serverPassword ? { serverPassword } : {}),
         version: "1.14.19",
+        apiVersion: runtimeMock.state.apiVersion,
         exitCode: null,
         external: Boolean(serverUrl),
       };
@@ -253,6 +265,19 @@ const OpenCodeRuntimeTestDouble: OpenCodeRuntimeShape = {
     runtimeMock.state.sdkClientInputs.push(input);
     return {} as unknown as ReturnType<OpenCodeRuntimeShape["createOpenCodeSdkClient"]>;
   },
+  createOpenCodeV2Client: (input) => {
+    runtimeMock.state.v2ClientInputs.push(input);
+    return {} as unknown as ReturnType<OpenCodeRuntimeShape["createOpenCodeV2Client"]>;
+  },
+  loadOpenCodeInventoryV2: () =>
+    runtimeMock.state.inventoryV2
+      ? Effect.succeed(runtimeMock.state.inventoryV2)
+      : Effect.fail(
+          new OpenCodeRuntimeError({
+            operation: "loadOpenCodeInventoryV2",
+            detail: "OpenCodeRuntimeTestDouble.loadOpenCodeInventoryV2 not used in this test",
+          }),
+        ),
   loadOpenCodeInventory: () =>
     runtimeMock.state.inventoryError
       ? Effect.fail(
@@ -430,6 +455,41 @@ it.layer(testLayer)("checkOpenCodeProviderStatus", (it) => {
         agentDescriptor.options.find((option) => option.isDefault === true)?.id,
         "build",
       );
+    }),
+  );
+
+  it.effect("loads model inventory through the v2 API when the server reports v2", () =>
+    Effect.gen(function* () {
+      runtimeMock.state.apiVersion = "v2";
+      runtimeMock.state.inventoryV2 = {
+        providers: [{ id: "openai", name: "OpenAI" }],
+        connectedProviders: ["openai"],
+        models: [
+          { providerID: "openai", modelID: "gpt-5", name: "GPT-5", variantIDs: ["high"] },
+          { providerID: "other", modelID: "other-1", name: "Other 1", variantIDs: [] },
+        ],
+        agents: [{ name: "build", mode: "primary", hidden: false }],
+        skills: [{ name: "review", description: "Reviews", location: "/skills/review/SKILL.md" }],
+        commands: [{ name: "init", description: "Init" }],
+      };
+
+      const snapshot = yield* checkProvider(makeOpenCodeSettings());
+
+      NodeAssert.equal(snapshot.status, "ready");
+      NodeAssert.deepEqual(
+        snapshot.models.map((entry) => entry.slug),
+        ["openai/gpt-5"],
+      );
+      NodeAssert.deepEqual(
+        snapshot.skills.map((skill) => skill.name),
+        ["review"],
+      );
+      NodeAssert.deepEqual(
+        snapshot.slashCommands.map((command) => command.name),
+        ["compact", "init"],
+      );
+      NodeAssert.equal(runtimeMock.state.v2ClientInputs.length, 1);
+      NodeAssert.equal(runtimeMock.state.v2ClientInputs[0]?.baseUrl, "http://127.0.0.1:4301");
     }),
   );
 

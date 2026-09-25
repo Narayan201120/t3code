@@ -24,9 +24,10 @@ import {
   MINIMUM_OPENCODE_VERSION,
   OpenCodeRuntime,
   openCodeRuntimeErrorDetail,
+  type OpenCodeApiVersion,
   type OpenCodeInventory,
+  type OpenCodeV2Inventory,
 } from "../opencodeRuntime.ts";
-import type { Agent, ProviderListResponse } from "@opencode-ai/sdk/v2";
 import * as OpenCodeServerOwner from "../OpenCodeServerOwner.ts";
 
 const OPENCODE_PRESENTATION = {
@@ -168,7 +169,7 @@ function inferDefaultVariant(
   return undefined;
 }
 
-function inferDefaultAgent(agents: ReadonlyArray<Agent>): string | undefined {
+function inferDefaultAgent(agents: ReadonlyArray<{ readonly name: string }>): string | undefined {
   return agents.find((agent) => agent.name === "build")?.name ?? agents[0]?.name ?? undefined;
 }
 
@@ -201,10 +202,14 @@ const DEFAULT_OPENCODE_MODEL_CAPABILITIES: ModelCapabilities = createModelCapabi
 
 function openCodeCapabilitiesForModel(input: {
   readonly providerID: string;
-  readonly model: ProviderListResponse["all"][number]["models"][string];
-  readonly agents: ReadonlyArray<Agent>;
+  readonly variantIDs: ReadonlyArray<string>;
+  readonly agents: ReadonlyArray<{
+    readonly name: string;
+    readonly mode: string;
+    readonly hidden?: boolean;
+  }>;
 }): ModelCapabilities {
-  const rawVariantValues = Object.keys(input.model.variants ?? {});
+  const rawVariantValues = input.variantIDs;
   // When a model advertises no variants, synthesize the standard reasoning
   // levels so the composer still offers a Reasoning selector (mirrors the
   // Codex/Grok experience where reasoning is always configurable). The set
@@ -278,11 +283,42 @@ function flattenOpenCodeModels(input: OpenCodeInventory): ReadonlyArray<ServerPr
         isCustom: false,
         capabilities: openCodeCapabilitiesForModel({
           providerID: provider.id,
-          model,
+          variantIDs: Object.keys(model.variants ?? {}),
           agents: input.agents,
         }),
       });
     }
+  }
+
+  return models.toSorted((left, right) => left.name.localeCompare(right.name));
+}
+
+function flattenOpenCodeV2Models(input: OpenCodeV2Inventory): ReadonlyArray<ServerProviderModel> {
+  const connected = new Set(input.connectedProviders);
+  const displayNames = new Map(input.providers.map((provider) => [provider.id, provider.name]));
+  const models: Array<ServerProviderModel> = [];
+
+  for (const model of input.models) {
+    if (!connected.has(model.providerID)) {
+      continue;
+    }
+    const name = nonEmptyTrimmed(model.name);
+    if (!name) {
+      continue;
+    }
+
+    const subProvider = nonEmptyTrimmed(displayNames.get(model.providerID) ?? "");
+    models.push({
+      slug: `${model.providerID}/${model.modelID}`,
+      name,
+      ...(subProvider ? { subProvider } : {}),
+      isCustom: false,
+      capabilities: openCodeCapabilitiesForModel({
+        providerID: model.providerID,
+        variantIDs: model.variantIDs,
+        agents: input.agents,
+      }),
+    });
   }
 
   return models.toSorted((left, right) => left.name.localeCompare(right.name));
@@ -294,7 +330,13 @@ function trimOptional(value: string | null | undefined): string | undefined {
 }
 
 export function openCodeSkillsToServerProviderSkills(
-  input: OpenCodeInventory["skills"] | undefined,
+  input:
+    | ReadonlyArray<{
+        readonly name?: string | null;
+        readonly description?: string | null;
+        readonly location?: string | null;
+      }>
+    | undefined,
 ): ReadonlyArray<ServerProviderSkill> {
   const skills: ServerProviderSkill[] = [];
   for (const skill of input ?? []) {
@@ -317,7 +359,14 @@ export function openCodeSkillsToServerProviderSkills(
 }
 
 export function openCodeCommandsToServerProviderSlashCommands(
-  input: OpenCodeInventory["commands"],
+  input:
+    | ReadonlyArray<{
+        readonly name?: string | null;
+        readonly description?: string | null;
+        readonly source?: string | null;
+        readonly hints?: ReadonlyArray<string>;
+      }>
+    | undefined,
 ): ReadonlyArray<ServerProviderSlashCommand> {
   const commands: ServerProviderSlashCommand[] = [COMPACT_SLASH_COMMAND];
   const names = new Set([COMPACT_SLASH_COMMAND.name]);
@@ -326,7 +375,7 @@ export function openCodeCommandsToServerProviderSlashCommands(
     if (!name || names.has(name) || command.source === "skill") continue;
     names.add(name);
     const description = trimOptional(command.description);
-    const hint = trimOptional(command.hints.join(" "));
+    const hint = trimOptional((command.hints ?? []).join(" "));
     commands.push({
       name,
       ...(description ? { description } : {}),
@@ -499,16 +548,55 @@ export const checkOpenCodeProviderStatus = Effect.fn("checkOpenCodeProviderStatu
     readonly url: string;
     readonly serverPassword?: string;
     readonly version: string;
-  }) =>
-    openCodeRuntime
+    readonly apiVersion: OpenCodeApiVersion;
+  }) => {
+    const passwordOption =
+      server.serverPassword !== undefined ? { serverPassword: server.serverPassword } : {};
+    if (server.apiVersion === "v2") {
+      return openCodeRuntime
+        .loadOpenCodeInventoryV2(
+          openCodeRuntime.createOpenCodeV2Client({
+            baseUrl: server.url,
+            ...passwordOption,
+          }),
+          cwd,
+        )
+        .pipe(
+          Effect.map((inventory) => ({
+            version: server.version,
+            models: providerModelsFromSettings(
+              flattenOpenCodeV2Models(inventory),
+              customModels,
+              DEFAULT_OPENCODE_MODEL_CAPABILITIES,
+            ),
+            skills: openCodeSkillsToServerProviderSkills(inventory.skills),
+            slashCommands: openCodeCommandsToServerProviderSlashCommands(inventory.commands),
+            connectedCount: inventory.connectedProviders.length,
+          })),
+        );
+    }
+    return openCodeRuntime
       .loadOpenCodeInventory(
         openCodeRuntime.createOpenCodeSdkClient({
           baseUrl: server.url,
           directory: cwd,
-          ...(server.serverPassword !== undefined ? { serverPassword: server.serverPassword } : {}),
+          ...passwordOption,
         }),
       )
-      .pipe(Effect.map((inventory) => ({ inventory, version: server.version })));
+      .pipe(
+        Effect.map((inventory) => ({
+          version: server.version,
+          models: providerModelsFromSettings(
+            flattenOpenCodeModels(inventory),
+            customModels,
+            DEFAULT_OPENCODE_MODEL_CAPABILITIES,
+          ),
+          skills: openCodeSkillsToServerProviderSkills(inventory.skills),
+          slashCommands: openCodeCommandsToServerProviderSlashCommands(inventory.commands),
+          connectedCount: inventory.providerList.connected.length,
+        })),
+      );
+  };
   const inventoryEffect = isExternalServer
     ? openCodeRuntime
         .connectToOpenCodeServer({
@@ -534,22 +622,16 @@ export const checkOpenCodeProviderStatus = Effect.fn("checkOpenCodeProviderStatu
 
   version = inventoryExit.value.version;
 
-  const models = providerModelsFromSettings(
-    flattenOpenCodeModels(inventoryExit.value.inventory),
-    customModels,
-    DEFAULT_OPENCODE_MODEL_CAPABILITIES,
-  );
-  const skills = openCodeSkillsToServerProviderSkills(inventoryExit.value.inventory.skills);
-  const connectedCount = inventoryExit.value.inventory.providerList.connected.length;
+  const models = inventoryExit.value.models;
+  const skills = inventoryExit.value.skills;
+  const connectedCount = inventoryExit.value.connectedCount;
   return buildServerProvider({
     presentation: OPENCODE_PRESENTATION,
     enabled: true,
     checkedAt,
     models,
     skills,
-    slashCommands: openCodeCommandsToServerProviderSlashCommands(
-      inventoryExit.value.inventory.commands,
-    ),
+    slashCommands: inventoryExit.value.slashCommands,
     probe: {
       installed: true,
       version,
