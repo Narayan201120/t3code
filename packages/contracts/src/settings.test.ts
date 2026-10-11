@@ -663,6 +663,15 @@ describe("ClientSettings context window meter", () => {
   });
 });
 
+describe("ClientSettings token rate", () => {
+  it("defaults off and preserves an explicit opt-in", () => {
+    expect(decodeClientSettings({}).tokenRateEnabled).toBe(false);
+    expect(decodeClientSettings({ tokenRateEnabled: true }).tokenRateEnabled).toBe(true);
+    expect(decodeClientSettingsPatch({ tokenRateEnabled: true }).tokenRateEnabled).toBe(true);
+    expect(() => decodeClientSettingsPatch({ tokenRateEnabled: "yes" })).toThrow();
+  });
+});
+
 describe("ClientSettings send shortcut", () => {
   it("defaults to Enter and validates the supported choices", () => {
     expect(decodeClientSettings({}).sendShortcut).toBe("enter");

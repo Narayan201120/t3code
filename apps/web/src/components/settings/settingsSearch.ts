@@ -434,6 +434,12 @@ export const SETTINGS_SEARCH_ITEMS = [
     searchTerms: ["enter return command ctrl multiline prompt new line composer"],
   },
   {
+    id: "token-rate",
+    title: "Token rate",
+    to: "/settings/general",
+    searchTerms: ["tokens per second tok speed generation rate finished response"],
+  },
+  {
     id: "follow-up-behavior",
     title: "Follow-up behavior",
     to: "/settings/general",

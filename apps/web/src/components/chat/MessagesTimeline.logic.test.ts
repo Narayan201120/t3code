@@ -5225,3 +5225,70 @@ describe("shouldCollapseUserMessage", () => {
     expect(shouldCollapseUserMessage(text)).toBe(false);
   });
 });
+
+describe("assistant token rates", () => {
+  const runId = RunId.make("run-rate");
+  const userEntry = {
+    id: "entry-user-rate",
+    kind: "message" as const,
+    createdAt: "2026-01-01T00:00:00Z",
+    message: {
+      id: MessageId.make("user-rate"),
+      role: "user" as const,
+      text: "Build it",
+      runId,
+      createdAt: "2026-01-01T00:00:00Z",
+      updatedAt: "2026-01-01T00:00:00Z",
+      streaming: false,
+    },
+  };
+  const assistantEntry = {
+    id: "entry-assistant-rate",
+    kind: "message" as const,
+    createdAt: "2026-01-01T00:00:01Z",
+    message: {
+      id: MessageId.make("assistant-rate"),
+      role: "assistant" as const,
+      text: "Done",
+      runId,
+      createdAt: "2026-01-01T00:00:01Z",
+      updatedAt: "2026-01-01T00:00:02Z",
+      streaming: false,
+    },
+  };
+  const baseInput = {
+    timelineEntries: [userEntry, assistantEntry],
+    isWorking: false,
+    activeTurnStartedAt: null,
+    turnDiffSummaries: [],
+    supportsConversationRollback: false,
+  };
+
+  it("attaches the run rate to finished assistant messages only", () => {
+    const rows = deriveMessagesTimelineRows({
+      ...baseInput,
+      tokenRateByRunId: new Map([[runId, { outputTokens: 120, elapsedMs: 10_000 }]]),
+    });
+
+    const assistant = rows.find(
+      (row): row is Extract<MessagesTimelineRow, { kind: "message" }> =>
+        row.kind === "message" && row.message.role === "assistant",
+    );
+    const user = rows.find(
+      (row): row is Extract<MessagesTimelineRow, { kind: "message" }> =>
+        row.kind === "message" && row.message.role === "user",
+    );
+    expect(assistant?.tokenRate).toEqual({ outputTokens: 120, elapsedMs: 10_000 });
+    expect(user?.tokenRate).toBeUndefined();
+  });
+
+  it("leaves rows alone without a rate map", () => {
+    const rows = deriveMessagesTimelineRows(baseInput);
+
+    for (const row of rows) {
+      if (row.kind === "message" || row.kind === "assistant-meta") {
+        expect(row.tokenRate).toBeUndefined();
+      }
+    }
+  });
+});

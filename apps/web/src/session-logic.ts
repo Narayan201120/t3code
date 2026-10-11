@@ -4,6 +4,8 @@ import {
   type OrchestrationV2ExecutionNode,
   type OrchestrationV2PlanArtifact,
   type OrchestrationV2ProjectedTurnItem,
+  type OrchestrationV2ProviderTurn,
+  type OrchestrationV2Run,
   type OrchestrationV2RunAttempt,
   type OrchestrationV2ThreadProjection,
   type OrchestrationV2TurnItem,
@@ -1064,6 +1066,62 @@ export function deriveRevertTurnCountByUserMessageId(input: {
     byUserMessageId.set(entry.message.id, Math.max(0, checkpoint.checkpointTurnCount - 1));
   }
   return byUserMessageId;
+}
+
+export interface RunTokenRate {
+  readonly outputTokens: number;
+  readonly elapsedMs: number;
+}
+
+const epochMsOrNull = (value: DateTime.Utc | null): number | null => {
+  if (value === null) return null;
+  const parsed = Date.parse(DateTime.formatIso(value));
+  return Number.isFinite(parsed) ? parsed : null;
+};
+
+/**
+ * End-of-turn generation rate per run, shown under a finished assistant
+ * response when the token-rate readout is enabled. Sums complete turn usage
+ * across the run's turns against the run's own clock. Partial or unavailable
+ * usage never produces a number, and unsettled runs are skipped.
+ */
+export function deriveTokenRateByRunId(input: {
+  readonly runs: ReadonlyArray<Pick<OrchestrationV2Run, "id" | "startedAt" | "completedAt">>;
+  readonly attempts: ReadonlyArray<Pick<OrchestrationV2RunAttempt, "id" | "runId">>;
+  readonly providerTurns: ReadonlyArray<
+    Pick<OrchestrationV2ProviderTurn, "runAttemptId" | "turnTokenUsage">
+  >;
+}): Map<RunId, RunTokenRate> {
+  const runIdByAttemptId = new Map(
+    input.attempts.map((attempt) => [attempt.id, attempt.runId] as const),
+  );
+  const outputTokensByRunId = new Map<RunId, number>();
+  for (const turn of input.providerTurns) {
+    const usage = turn.turnTokenUsage;
+    if (turn.runAttemptId === null || usage === undefined) continue;
+    if (usage.usageStatus !== "complete") continue;
+    const runId = runIdByAttemptId.get(turn.runAttemptId);
+    if (runId === undefined) continue;
+    outputTokensByRunId.set(runId, (outputTokensByRunId.get(runId) ?? 0) + usage.outputTokens);
+  }
+  const rates = new Map<RunId, RunTokenRate>();
+  for (const run of input.runs) {
+    const startMs = epochMsOrNull(run.startedAt);
+    const endMs = epochMsOrNull(run.completedAt);
+    if (startMs === null || endMs === null) continue;
+    const elapsedMs = endMs - startMs;
+    const outputTokens = outputTokensByRunId.get(run.id);
+    if (outputTokens === undefined || outputTokens <= 0 || elapsedMs <= 0) continue;
+    rates.set(run.id, { outputTokens, elapsedMs });
+  }
+  return rates;
+}
+
+/** Tokens per second for a finished turn, e.g. "12 tok/s". */
+export function formatTokenRate(outputTokens: number, elapsedMs: number): string {
+  const perSecond = outputTokens / (elapsedMs / 1000);
+  const rounded = perSecond < 10 ? Math.round(perSecond * 10) / 10 : Math.round(perSecond);
+  return `${rounded} tok/s`;
 }
 
 export function derivePhase(runtime: ThreadRuntimeSummary | null): SessionPhase {

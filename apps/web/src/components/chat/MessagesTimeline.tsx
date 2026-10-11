@@ -93,12 +93,14 @@ import { FileDiff } from "@pierre/diffs/react";
 import { DiffWorkerPoolProvider } from "../DiffWorkerPoolProvider";
 import {
   type TimelineEntry,
+  formatTokenRate,
   providerErrorPresentation,
   createMessageAttachmentPreviewProjector,
   selectMessageImageResources,
   workEntryDisplayIndicatesToolFailure,
   workEntrySignalsSevereFailure,
   workLogEntryIsToolLike,
+  type RunTokenRate,
 } from "../../session-logic";
 import type { CodexArtifactTemplate } from "@t3tools/shared/codexArtifactTemplates";
 import {
@@ -511,6 +513,8 @@ interface MessagesTimelineProps {
   skills?: ReadonlyArray<Pick<ServerProviderSkill, "name" | "displayName">>;
   providerStatuses: ReadonlyArray<ServerProvider>;
   runs: ReadonlyArray<HandoffTimelineRun>;
+  /** Settled-run token rates for the assistant footer readout; absent when disabled. */
+  tokenRateByRunId?: ReadonlyMap<RunId, RunTokenRate>;
   anchorMessageId: MessageId | null;
   onAnchorReady: (messageId: MessageId, anchorIndex: number) => void;
   onAnchorSizeChanged: (messageId: MessageId, size: number) => void;
@@ -616,6 +620,7 @@ const ConversationTimeline = memo(function ConversationTimeline({
   skills = EMPTY_TIMELINE_SKILLS,
   providerStatuses,
   runs: runsProp,
+  tokenRateByRunId: tokenRateByRunIdProp,
   anchorMessageId,
   onAnchorReady,
   onAnchorSizeChanged,
@@ -878,6 +883,9 @@ const ConversationTimeline = memo(function ConversationTimeline({
     readonly workspaceRoot: string | undefined;
     readonly projection: MessagesTimelineRowsProjection;
   } | null>(null);
+  // Stabilized beside the other row inputs so the map's fresh identity per
+  // projection event does not defeat the streaming fast path below.
+  const tokenRateByRunId = useStableTokenRates(tokenRateByRunIdProp);
   const rawRows = useMemo(() => {
     const previous = rowsProjectionRef.current;
     const projection = deriveMessagesTimelineRowsWithState(
@@ -894,6 +902,7 @@ const ConversationTimeline = memo(function ConversationTimeline({
         turnDiffSummaries,
         supportsConversationRollback,
         worktreeSetup,
+        ...(tokenRateByRunId === undefined ? {} : { tokenRateByRunId }),
       },
       previous?.threadKey === listIdentityKey && previous.workspaceRoot === workspaceRoot
         ? previous.projection
@@ -917,6 +926,7 @@ const ConversationTimeline = memo(function ConversationTimeline({
     turnDiffSummaries,
     supportsConversationRollback,
     worktreeSetup,
+    tokenRateByRunId,
   ]);
   const rows = useStableRows(rawRows, listIdentityKey);
   // Run status/timestamps churn on every stream event; the shared row context
@@ -2792,6 +2802,7 @@ function AssistantTimelineRow({ row }: { row: Extract<TimelineRow, { kind: "mess
             message={row.message}
             showCopyButton={row.showAssistantCopyButton}
             copyStreaming={row.assistantCopyStreaming}
+            tokenRate={row.tokenRate}
           />
         ) : null}
       </div>
@@ -2859,6 +2870,7 @@ function AssistantMetaTimelineRow({
         showCopyButton={row.showAssistantCopyButton}
         copyStreaming={row.assistantCopyStreaming}
         alwaysVisible
+        tokenRate={row.tokenRate}
       />
     </div>
   );
@@ -2871,6 +2883,7 @@ function AssistantMessageMeta({
   showCopyButton,
   copyStreaming,
   alwaysVisible = false,
+  tokenRate,
 }: {
   className?: string;
   projectedItem?: Extract<TimelineRow, { kind: "message" }>["projectedItem"];
@@ -2878,6 +2891,7 @@ function AssistantMessageMeta({
   showCopyButton: boolean;
   copyStreaming: boolean;
   alwaysVisible?: boolean;
+  tokenRate: RunTokenRate | undefined;
 }) {
   const ctx = use(TimelineRowCtx);
 
@@ -2903,6 +2917,16 @@ function AssistantMessageMeta({
       />
       {projectedItem?.item.type === "assistant_message" ? (
         <AssistantForkButton projectedItem={projectedItem} />
+      ) : null}
+      {tokenRate && !message.streaming ? (
+        <Tooltip>
+          <TooltipTrigger render={<p className="text-muted-foreground text-xs tabular-nums" />}>
+            {formatTokenRate(tokenRate.outputTokens, tokenRate.elapsedMs)}
+          </TooltipTrigger>
+          <TooltipPopup>
+            {`${tokenRate.outputTokens} output tokens in ${(tokenRate.elapsedMs / 1000).toFixed(1)}s`}
+          </TooltipPopup>
+        </Tooltip>
       ) : null}
       {!message.streaming && (
         <Tooltip>
@@ -4908,6 +4932,31 @@ function useStableHandoffRuns(
     prev.current = { signature, value };
     return value;
   }, [runs]);
+}
+
+/**
+ * Content-stable token rates. The incoming map is rebuilt with every
+ * projection event, but settled-run rates never change afterwards — keep the
+ * reference until a rate is added so the row projection fast path survives.
+ */
+function useStableTokenRates(
+  rates: ReadonlyMap<RunId, RunTokenRate> | undefined,
+): ReadonlyMap<RunId, RunTokenRate> | undefined {
+  const prev = useRef<{ signature: string; value: ReadonlyMap<RunId, RunTokenRate> }>({
+    signature: "",
+    value: new Map(),
+  });
+  return useMemo(() => {
+    if (rates === undefined) return undefined;
+    const signature = [...rates]
+      .map(([runId, rate]) => `${runId} ${rate.outputTokens} ${rate.elapsedMs}`)
+      .sort()
+      .join("\n");
+    if (signature !== prev.current.signature) {
+      prev.current = { signature, value: new Map(rates) };
+    }
+    return prev.current.value;
+  }, [rates]);
 }
 
 /** Returns a structurally-shared copy of `rows`: for each row whose content

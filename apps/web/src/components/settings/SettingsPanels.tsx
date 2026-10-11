@@ -617,6 +617,9 @@ export function useSettingsRestore(onRestored?: () => void) {
         ? ["Rich text composer"]
         : []),
       ...(settings.sendShortcut !== DEFAULT_UNIFIED_SETTINGS.sendShortcut ? ["Send shortcut"] : []),
+      ...(settings.tokenRateEnabled !== DEFAULT_UNIFIED_SETTINGS.tokenRateEnabled
+        ? ["Token rate"]
+        : []),
       ...(settings.followUpBehavior !== DEFAULT_UNIFIED_SETTINGS.followUpBehavior
         ? ["Follow-up behavior"]
         : []),
@@ -683,6 +686,7 @@ export function useSettingsRestore(onRestored?: () => void) {
       settings.composerCollapseOnScroll,
       settings.composerRichTextEnabled,
       settings.sendShortcut,
+      settings.tokenRateEnabled,
       settings.followUpBehavior,
       settings.addProjectBaseDirectory,
       settings.defaultThreadEnvMode,
@@ -805,6 +809,7 @@ export function useSettingsRestore(onRestored?: () => void) {
       composerCollapseOnScroll: DEFAULT_UNIFIED_SETTINGS.composerCollapseOnScroll,
       composerRichTextEnabled: DEFAULT_UNIFIED_SETTINGS.composerRichTextEnabled,
       sendShortcut: DEFAULT_UNIFIED_SETTINGS.sendShortcut,
+      tokenRateEnabled: DEFAULT_UNIFIED_SETTINGS.tokenRateEnabled,
       followUpBehavior: DEFAULT_UNIFIED_SETTINGS.followUpBehavior,
       contextWindowMeterEnabled: DEFAULT_UNIFIED_SETTINGS.contextWindowMeterEnabled,
       environmentIdentificationMode: DEFAULT_UNIFIED_SETTINGS.environmentIdentificationMode,
@@ -2836,6 +2841,30 @@ export function GeneralSettingsPanel() {
                 ))}
               </SelectPopup>
             </Select>
+          }
+        />
+
+        <SettingsRow
+          {...searchableSetting("token-rate")}
+          description="Show tokens per second under a finished assistant response."
+          resetAction={
+            settings.tokenRateEnabled !== DEFAULT_UNIFIED_SETTINGS.tokenRateEnabled ? (
+              <SettingResetButton
+                label="token rate"
+                onClick={() =>
+                  updateSettings({
+                    tokenRateEnabled: DEFAULT_UNIFIED_SETTINGS.tokenRateEnabled,
+                  })
+                }
+              />
+            ) : null
+          }
+          control={
+            <Switch
+              checked={settings.tokenRateEnabled}
+              onCheckedChange={(checked) => updateSettings({ tokenRateEnabled: Boolean(checked) })}
+              aria-label="Token rate"
+            />
           }
         />
 

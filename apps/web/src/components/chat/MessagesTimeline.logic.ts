@@ -35,6 +35,7 @@ import {
   workEntryIndicatesToolSuccess,
   workEntryIndicatesToolNeutralStatus,
   workLogEntryIsToolLike,
+  type RunTokenRate,
   type TimelineEntry,
   type WorkLogEntry,
 } from "../../session-logic";
@@ -607,6 +608,7 @@ type MessagesTimelineRowContent =
       assistantCopyStreaming: boolean;
       assistantTurnDiffSummary?: TurnDiffSummary | undefined;
       revertTurnCount?: number | undefined;
+      tokenRate?: RunTokenRate | undefined;
     }
   | {
       kind: "assistant-meta";
@@ -616,6 +618,7 @@ type MessagesTimelineRowContent =
       message: ChatMessage;
       showAssistantCopyButton: boolean;
       assistantCopyStreaming: boolean;
+      tokenRate?: RunTokenRate | undefined;
     }
   | {
       kind: "event";
@@ -1223,6 +1226,7 @@ function attachTrailingToolGroupsToAssistant(
       message: row.message,
       showAssistantCopyButton: row.showAssistantCopyButton,
       assistantCopyStreaming: row.assistantCopyStreaming,
+      ...(row.tokenRate === undefined ? {} : { tokenRate: row.tokenRate }),
     });
   }
 
@@ -1339,6 +1343,8 @@ export function deriveMessagesTimelineRows(input: {
   activeTurnStartedAt?: string | null;
   turnDiffSummaries: ReadonlyArray<TurnDiffSummary>;
   supportsConversationRollback: boolean;
+  /** Settled-run token rates (`deriveTokenRateByRunId`), for the assistant footer readout. */
+  tokenRateByRunId?: ReadonlyMap<RunId, RunTokenRate>;
   /** Task ids of subagents still working, used by the active tool indicator. */
   liveAgentTaskIds?: ReadonlySet<string> | undefined;
   /** Live bootstrap progress. Renders a stage card under the first user message. */
@@ -1830,6 +1836,10 @@ export function deriveMessagesTimelineRows(input: {
       revertTurnCount:
         timelineEntry.message.role === "user"
           ? revertTurnCountByUserMessageId.get(timelineEntry.message.id)
+          : undefined,
+      tokenRate:
+        timelineEntry.message.role === "assistant" && timelineEntry.message.runId !== null
+          ? input.tokenRateByRunId?.get(timelineEntry.message.runId)
           : undefined,
     });
   }

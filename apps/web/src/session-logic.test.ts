@@ -28,8 +28,10 @@ import {
   deriveTimelineEntriesFromVisibleTurnItems,
   deriveTimelineEntriesFromVisibleTurnItemsWithState,
   deriveRevertTurnCountByUserMessageId,
+  deriveTokenRateByRunId,
   derivePhase,
   findLatestProposedPlan,
+  formatTokenRate,
   isLatestRunSettled,
   selectHandoffImageResources,
   selectMessageImageResources,
@@ -299,6 +301,78 @@ describe("V2 session presentation", () => {
 
     expect([...targets]).toEqual([[turnStartMessageId, 0]]);
     expect(targets.has(steerMessageId)).toBe(false);
+  });
+
+  describe("end-of-turn token rates", () => {
+    const instant = (iso: string) => DateTime.makeUnsafe(iso);
+    const run = (id: string, startedAt: string | null, completedAt: string | null) => ({
+      id: RunId.make(id),
+      startedAt: startedAt === null ? null : instant(startedAt),
+      completedAt: completedAt === null ? null : instant(completedAt),
+    });
+    const attempt = (id: string, runId: string) => ({
+      id: RunAttemptId.make(id),
+      runId: RunId.make(runId),
+    });
+    const completeTurn = (attemptId: string, outputTokens: number) => ({
+      runAttemptId: RunAttemptId.make(attemptId),
+      turnTokenUsage: {
+        usageScope: "main_agent" as const,
+        usageStatus: "complete" as const,
+        inputTokens: 100,
+        outputTokens,
+        hasSubagents: false,
+      },
+    });
+    const partialTurn = (attemptId: string) => ({
+      runAttemptId: RunAttemptId.make(attemptId),
+      turnTokenUsage: {
+        usageScope: "main_agent" as const,
+        usageStatus: "partial" as const,
+        hasSubagents: false,
+      },
+    });
+
+    it("sums complete turn usage against the run clock", () => {
+      const rates = deriveTokenRateByRunId({
+        runs: [run("run-1", "2026-06-20T00:00:00.000Z", "2026-06-20T00:00:10.000Z")],
+        attempts: [attempt("attempt-1", "run-1"), attempt("attempt-2", "run-1")],
+        providerTurns: [completeTurn("attempt-1", 60), completeTurn("attempt-2", 40)],
+      });
+
+      expect([...rates]).toEqual([["run-1", { outputTokens: 100, elapsedMs: 10_000 }]]);
+      expect(formatTokenRate(100, 10_000)).toBe("10 tok/s");
+    });
+
+    it("skips unsettled runs and unusable usage", () => {
+      const rates = deriveTokenRateByRunId({
+        runs: [
+          run("run-running", "2026-06-20T00:00:00.000Z", null),
+          run("run-partial", "2026-06-20T00:00:00.000Z", "2026-06-20T00:00:10.000Z"),
+          run("run-unstarted", null, null),
+          run("run-instant", "2026-06-20T00:00:00.000Z", "2026-06-20T00:00:00.000Z"),
+        ],
+        attempts: [attempt("attempt-1", "run-partial")],
+        providerTurns: [partialTurn("attempt-1")],
+      });
+
+      expect(rates.size).toBe(0);
+    });
+
+    it("ignores turns from unknown attempts", () => {
+      const rates = deriveTokenRateByRunId({
+        runs: [run("run-1", "2026-06-20T00:00:00.000Z", "2026-06-20T00:00:10.000Z")],
+        attempts: [],
+        providerTurns: [completeTurn("attempt-unknown", 100)],
+      });
+
+      expect(rates.size).toBe(0);
+    });
+
+    it("keeps one decimal below ten per second", () => {
+      expect(formatTokenRate(25, 10_000)).toBe("2.5 tok/s");
+      expect(formatTokenRate(1_234, 10_000)).toBe("123 tok/s");
+    });
   });
 
   it("uses visible turn item order and keeps provider errors in the work log", () => {

@@ -191,6 +191,7 @@ import {
   derivePendingUserInputs,
   derivePhase,
   deriveTimelineEntriesFromVisibleTurnItemsWithState,
+  deriveTokenRateByRunId,
   selectHandoffImageResources,
   type TimelineEntriesProjection,
   deriveActivePlanState,
@@ -1779,6 +1780,17 @@ export default function ChatView(props: ChatViewProps) {
     (store) => store.setStickyModelSelection,
   );
   const timestampFormat = settings.timestampFormat;
+  const tokenRateByRunId = useMemo(
+    () =>
+      settings.tokenRateEnabled && serverProjection
+        ? deriveTokenRateByRunId({
+            runs: serverProjection.runs,
+            attempts: serverProjection.attempts,
+            providerTurns: serverProjection.providerTurns,
+          })
+        : undefined,
+    [serverProjection, settings.tokenRateEnabled],
+  );
   const navigate = useNavigate();
   const citationLocation = useLocation({
     select: (location) => ({
@@ -11460,6 +11472,9 @@ export default function ChatView(props: ChatViewProps) {
                   )?.serverConfig?.providers ?? EMPTY_PROVIDERS
                 }
                 runs={paintOnlyDisplayedTimeline ? [] : (serverProjection?.runs ?? [])}
+                {...(paintOnlyDisplayedTimeline || tokenRateByRunId === undefined
+                  ? {}
+                  : { tokenRateByRunId })}
                 latestRun={paintOnlyDisplayedTimeline ? null : activeActivityRun}
                 runningRunId={paintOnlyDisplayedTimeline ? null : activeRunningTurnId}
                 turnDiffSummaries={
