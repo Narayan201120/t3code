@@ -295,7 +295,7 @@ export const OpenCodeDriver: ProviderDriver<
           Effect.gen(function* () {
             const location = { directory: host.paths.cwd };
             const eventStream = yield* events.pipe(Effect.option);
-            const runLoader = <E2>(ready: Effect.Effect<void, E2>) =>
+            const runLoader = <E2>(ready: Effect.Effect<void, E2> | undefined) =>
               makeOpenCode2ModelLoader(
                 loadOpenCode2Catalog(client, host.paths.cwd),
                 ready,
@@ -324,6 +324,13 @@ export const OpenCodeDriver: ProviderDriver<
                 lastLoadedOpenCode2ServerUrl = url;
               }
               return catalog;
+            }
+
+            if (!external) {
+              // Managed server with no event stream: integration metadata
+              // cannot vouch for catalog readiness, so report the first read
+              // as unsettled and keep the cached catalog.
+              return yield* runLoader(undefined);
             }
 
             const catalog = yield* runLoader(

@@ -419,7 +419,7 @@ export const OPENCODE_2_CATALOG_LOADING_MESSAGE = "OpenCode 2 is still loading i
 
 export const makeOpenCode2ModelLoader = <E, E2>(
   list: Effect.Effect<ReadonlyArray<OpenCode2Model>, E>,
-  ready: Effect.Effect<void, E2>,
+  ready: Effect.Effect<void, E2> | undefined,
   lastLoaded: ReadonlyArray<OpenCode2Model> | undefined,
 ): Effect.Effect<OpenCode2ModelCatalog, E> =>
   Effect.gen(function* () {
@@ -436,6 +436,9 @@ export const makeOpenCode2ModelLoader = <E, E2>(
     }
 
     const fallback = initial.length > 0 ? initial : (lastLoaded ?? []);
+    // Without a catalog-specific readiness signal, integration metadata must
+    // not mark the catalog settled: report the first read as unsettled.
+    if (ready === undefined) return { _tag: "Unsettled", models: fallback };
     const readiness = yield* ready.pipe(
       Effect.timeoutOption(OPENCODE_2_CATALOG_TIMEOUT),
       Effect.option,

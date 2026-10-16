@@ -914,6 +914,16 @@ it.effect("returns unsettled immediately when readiness fails", () =>
   }).pipe(Effect.provide(TestClock.layer())),
 );
 
+it.effect("returns unsettled without waiting when no readiness signal exists", () =>
+  Effect.gen(function* () {
+    const load = makeOpenCode2ModelLoader(Effect.succeed([bigPickle]), undefined, undefined);
+    const fiber = yield* load.pipe(Effect.forkChild);
+    yield* Effect.yieldNow;
+
+    NodeAssert.deepEqual(yield* Fiber.join(fiber), { _tag: "Unsettled", models: [bigPickle] });
+  }).pipe(Effect.provide(TestClock.layer())),
+);
+
 it.effect("keeps the last settled catalog when readiness times out", () =>
   Effect.gen(function* () {
     const load = makeOpenCode2ModelLoader(Effect.succeed([]), Effect.never, [bigPickle]);
