@@ -28,6 +28,7 @@ import {
   loadOpenCode2Workspace,
   makeOpenCode2ModelLoader,
   makePendingOpenCodeProvider,
+  type OpenCode2Model,
   openCode2CommandsToServerProviderSlashCommands,
   openCode2SkillsToServerProviderSkills,
   openCodeSkillsToServerProviderSkills,
@@ -287,10 +288,50 @@ export const OpenCodeDriver: ProviderDriver<
           Effect.provideService(OpenCode2Server.OpenCode2Server, openCode2Server),
         ),
       });
-      const loadOpenCode2Models = yield* makeOpenCode2ModelLoader(
-        openCode2Server.withConnection(({ client }) =>
-          loadOpenCode2Catalog(client, host.paths.cwd),
-        ),
+      let lastLoadedOpenCode2Models: ReadonlyArray<OpenCode2Model> | undefined;
+      let lastLoadedOpenCode2ServerUrl: string | undefined;
+      const loadOpenCode2Models = openCode2Server.withConnection(
+        ({ client, events, external, url }) =>
+          Effect.gen(function* () {
+            const location = { directory: host.paths.cwd };
+            const eventStream = yield* events.pipe(Effect.option);
+            let ready: Effect.Effect<void>;
+
+            if (!external && eventStream._tag === "Some") {
+              // Subscribe before `model.list`; its first response can be empty or partial.
+              const updated = yield* Deferred.make<void>();
+              yield* eventStream.value.pipe(
+                Stream.runForEach((event) =>
+                  "location" in event &&
+                  event.type === "model.updated" &&
+                  event.location?.directory === host.paths.cwd
+                    ? Deferred.succeed(updated, undefined).pipe(Effect.asVoid)
+                    : Effect.void,
+                ),
+                Effect.ignore,
+                Effect.forkScoped,
+              );
+              ready = Deferred.await(updated);
+            } else {
+              ready = client.integration.list({ location }).pipe(
+                Effect.asVoid,
+                Effect.catch(() => Effect.never),
+              );
+            }
+
+            const catalog = yield* makeOpenCode2ModelLoader(
+              loadOpenCode2Catalog(client, host.paths.cwd),
+              ready,
+              !external && url === lastLoadedOpenCode2ServerUrl
+                ? lastLoadedOpenCode2Models
+                : undefined,
+            );
+            if (catalog._tag === "Settled") {
+              lastLoadedOpenCode2Models = catalog.models;
+              lastLoadedOpenCode2ServerUrl = url;
+            }
+            return catalog;
+          }).pipe(Effect.scoped),
       );
       const listOpenCode2Workspace = (cwd: string) =>
         openCode2Server.withConnection(({ client, events }) =>

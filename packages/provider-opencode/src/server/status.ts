@@ -9,7 +9,6 @@ import * as Cause from "effect/Cause";
 import * as Data from "effect/Data";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
-import * as Schedule from "effect/Schedule";
 
 import { createModelCapabilities } from "@t3tools/shared/model";
 import { compareSemverVersions } from "@t3tools/shared/semver";
@@ -396,28 +395,54 @@ function subProviderLabelFor(input: {
     : label;
 }
 
-/**
- * A server loads its catalog lazily and lists nothing for its first few
- * hundred milliseconds, and a local instance starts a fresh server for each
- * status check. So an empty list is read again for a while, and the last
- * non-empty list stands in if the catalog still has not loaded.
- */
+export type OpenCode2ModelCatalog =
+  | { readonly _tag: "Settled"; readonly models: ReadonlyArray<OpenCode2Model> }
+  | { readonly _tag: "Unsettled"; readonly models: ReadonlyArray<OpenCode2Model> };
+
+const modelCatalogFingerprint = (models: ReadonlyArray<OpenCode2Model>): string =>
+  models
+    .map(
+      (model) =>
+        `${model.providerID}/${model.id}\0${model.name}\0${model.providerName ?? ""}\0${model.variants
+          .map((variant) => variant.id)
+          .toSorted()
+          .join(",")}`,
+    )
+    .toSorted()
+    .join("\n");
+
+const OPENCODE_2_CATALOG_TIMEOUT = "30 seconds";
+
 export const makeOpenCode2ModelLoader = <E>(
   list: Effect.Effect<ReadonlyArray<OpenCode2Model>, E>,
-) =>
-  Effect.sync(() => {
-    let lastLoaded: ReadonlyArray<OpenCode2Model> = [];
-    return list.pipe(
-      Effect.repeat({
-        until: (models) => models.length > 0,
-        schedule: Schedule.spaced("250 millis"),
-      }),
-      Effect.timeoutOption("5 seconds"),
-      Effect.map((loaded) => {
-        if (loaded._tag === "Some" && loaded.value.length > 0) lastLoaded = loaded.value;
-        return lastLoaded;
-      }),
+  ready: Effect.Effect<void>,
+  lastLoaded: ReadonlyArray<OpenCode2Model> | undefined,
+): Effect.Effect<OpenCode2ModelCatalog, E> =>
+  Effect.gen(function* () {
+    const initialRead = yield* list.pipe(Effect.timeoutOption(OPENCODE_2_CATALOG_TIMEOUT));
+    if (initialRead._tag === "None") {
+      return { _tag: "Unsettled", models: lastLoaded ?? [] };
+    }
+    const initial = initialRead.value;
+    if (
+      lastLoaded !== undefined &&
+      modelCatalogFingerprint(initial) === modelCatalogFingerprint(lastLoaded)
+    ) {
+      return { _tag: "Settled", models: initial };
+    }
+
+    const fallback = initial.length > 0 ? initial : (lastLoaded ?? []);
+    const readiness = yield* ready.pipe(
+      Effect.timeoutOption(OPENCODE_2_CATALOG_TIMEOUT),
+      Effect.option,
     );
+    if (readiness._tag === "None" || readiness.value._tag === "None") {
+      return { _tag: "Unsettled", models: fallback };
+    }
+
+    const settledRead = yield* list.pipe(Effect.timeoutOption(OPENCODE_2_CATALOG_TIMEOUT));
+    if (settledRead._tag === "None") return { _tag: "Unsettled", models: fallback };
+    return { _tag: "Settled", models: settledRead.value };
   });
 
 export interface OpenCode2Workspace {
@@ -519,7 +544,7 @@ const checkOpenCode2 = Effect.fn("checkOpenCode2")(function* (
   settings: OpenCodeSettings,
   version: string,
   checkedAt: string,
-  loadModels: Effect.Effect<ReadonlyArray<OpenCode2Model>, OpenCodeRuntime.OpenCodeRuntimeError>,
+  loadModels: Effect.Effect<OpenCode2ModelCatalog, OpenCodeRuntime.OpenCodeRuntimeError>,
 ) {
   const result = yield* Effect.exit(loadModels);
   const probe = (status: "ready" | "warning" | "error", message: string) => ({
@@ -544,8 +569,9 @@ const checkOpenCode2 = Effect.fn("checkOpenCode2")(function* (
       probe: probe("error", "OpenCode could not load its model list."),
     });
   }
+  const { models: listedModels } = result.value;
   const models = providerModelsFromSettings(
-    result.value
+    listedModels
       .map((model) => {
         const subProvider = subProviderLabelFor(model);
         return {
@@ -567,12 +593,19 @@ const checkOpenCode2 = Effect.fn("checkOpenCode2")(function* (
     models,
     slashCommands: [COMPACT_SLASH_COMMAND],
     probe:
-      result.value.length > 0
+      result.value._tag === "Unsettled"
         ? probe(
-            "ready",
-            `OpenCode ${version} lists ${result.value.length} model${result.value.length === 1 ? "" : "s"}.`,
+            "warning",
+            listedModels.length > 0
+              ? "OpenCode 2 is still loading its model catalog."
+              : "OpenCode 2 is running, but it did not list any models yet.",
           )
-        : probe("warning", "OpenCode 2 is running, but it did not list any models yet."),
+        : listedModels.length > 0
+          ? probe(
+              "ready",
+              `OpenCode ${version} lists ${listedModels.length} model${listedModels.length === 1 ? "" : "s"}.`,
+            )
+          : probe("warning", "OpenCode 2 is ready, but it listed no models."),
   });
 });
 
@@ -580,10 +613,7 @@ export const checkOpenCodeProviderStatus = Effect.fn("checkOpenCodeProviderStatu
   openCodeSettings: OpenCodeSettings,
   cwd: string,
   probeRuntime: Effect.Effect<ProbedOpenCode, OpenCodeRuntime.OpenCodeRuntimeError>,
-  loadOpenCode2Models: Effect.Effect<
-    ReadonlyArray<OpenCode2Model>,
-    OpenCodeRuntime.OpenCodeRuntimeError
-  >,
+  loadOpenCode2Models: Effect.Effect<OpenCode2ModelCatalog, OpenCodeRuntime.OpenCodeRuntimeError>,
 ): Effect.fn.Return<
   ServerProviderDraft,
   never,

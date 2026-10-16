@@ -1132,7 +1132,33 @@ it.layer(
         models: [],
         message: "Failed to refresh OpenCode models.",
       } satisfies ServerProvider;
-
+      const unsettledEmptyCatalog = {
+        ...previousProvider,
+        status: "warning",
+        auth: { status: "unknown" },
+        checkedAt: "2026-07-17T00:06:00.000Z",
+        models: [],
+        message: "OpenCode 2 is running, but it did not list any models yet.",
+      } satisfies ServerProvider;
+      const unsettledPartialCatalog = {
+        ...unsettledEmptyCatalog,
+        checkedAt: "2026-07-17T00:07:00.000Z",
+        models: [
+          {
+            slug: "new-plugin/early",
+            name: "Early",
+            subProvider: "New Plugin",
+            isCustom: false,
+            capabilities: null,
+          },
+        ],
+        message: "OpenCode 2 is still loading its model catalog.",
+      } satisfies ServerProvider;
+      const settledEmptyCatalog = {
+        ...unsettledEmptyCatalog,
+        checkedAt: "2026-07-17T00:08:00.000Z",
+        message: "OpenCode 2 is ready, but it listed no models.",
+      } satisfies ServerProvider;
       assert.deepStrictEqual(
         ProviderRegistry.mergeProviderSnapshot(previousProvider, pendingProvider).models,
         [...previousProvider.models],
@@ -1151,6 +1177,18 @@ it.layer(
       );
       assert.deepStrictEqual(
         ProviderRegistry.mergeProviderSnapshot(previousProvider, missingProvider).models,
+        [],
+      );
+      assert.deepStrictEqual(
+        ProviderRegistry.mergeProviderSnapshot(previousProvider, unsettledEmptyCatalog).models,
+        [...previousProvider.models],
+      );
+      assert.deepStrictEqual(
+        ProviderRegistry.mergeProviderSnapshot(previousProvider, unsettledPartialCatalog).models,
+        [...unsettledPartialCatalog.models, ...previousProvider.models],
+      );
+      assert.deepStrictEqual(
+        ProviderRegistry.mergeProviderSnapshot(previousProvider, settledEmptyCatalog).models,
         [],
       );
 
