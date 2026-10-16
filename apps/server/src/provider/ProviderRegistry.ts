@@ -21,6 +21,10 @@ import * as Ref from "effect/Ref";
 import * as Stream from "effect/Stream";
 import * as Semaphore from "effect/Semaphore";
 
+import {
+  OPENCODE_2_CATALOG_EMPTY_MESSAGE,
+  OPENCODE_2_CATALOG_LOADING_MESSAGE,
+} from "@t3tools/provider-opencode/server";
 import * as ModelManifest from "./ModelManifest.ts";
 import { applyProviderCompatibility } from "./providerCompatibility.ts";
 import * as ServerConfig from "../config.ts";
@@ -193,8 +197,8 @@ const shouldRetainMissingProviderModels = (provider: ServerProvider): boolean =>
     provider.driver === ProviderDriverKind.make("opencode") &&
     provider.installed &&
     provider.status === "warning" &&
-    (provider.message === "OpenCode 2 is running, but it did not list any models yet." ||
-      provider.message === "OpenCode 2 is still loading its model catalog.");
+    (provider.message === OPENCODE_2_CATALOG_EMPTY_MESSAGE ||
+      provider.message === OPENCODE_2_CATALOG_LOADING_MESSAGE);
   const didInstalledProviderProbeFail = provider.installed && provider.status === "error";
   return (
     isPendingAntigravityAuthentication ||

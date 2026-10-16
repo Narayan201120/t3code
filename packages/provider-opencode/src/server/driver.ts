@@ -295,7 +295,14 @@ export const OpenCodeDriver: ProviderDriver<
           Effect.gen(function* () {
             const location = { directory: host.paths.cwd };
             const eventStream = yield* events.pipe(Effect.option);
-            let ready: Effect.Effect<void>;
+            const runLoader = <E2>(ready: Effect.Effect<void, E2>) =>
+              makeOpenCode2ModelLoader(
+                loadOpenCode2Catalog(client, host.paths.cwd),
+                ready,
+                !external && url === lastLoadedOpenCode2ServerUrl
+                  ? lastLoadedOpenCode2Models
+                  : undefined,
+              );
 
             if (!external && eventStream._tag === "Some") {
               // Subscribe before `model.list`; its first response can be empty or partial.
@@ -311,20 +318,16 @@ export const OpenCodeDriver: ProviderDriver<
                 Effect.ignore,
                 Effect.forkScoped,
               );
-              ready = Deferred.await(updated);
-            } else {
-              ready = client.integration.list({ location }).pipe(
-                Effect.asVoid,
-                Effect.catch(() => Effect.never),
-              );
+              const catalog = yield* runLoader(Deferred.await(updated));
+              if (catalog._tag === "Settled") {
+                lastLoadedOpenCode2Models = catalog.models;
+                lastLoadedOpenCode2ServerUrl = url;
+              }
+              return catalog;
             }
 
-            const catalog = yield* makeOpenCode2ModelLoader(
-              loadOpenCode2Catalog(client, host.paths.cwd),
-              ready,
-              !external && url === lastLoadedOpenCode2ServerUrl
-                ? lastLoadedOpenCode2Models
-                : undefined,
+            const catalog = yield* runLoader(
+              client.integration.list({ location }).pipe(Effect.asVoid),
             );
             if (catalog._tag === "Settled") {
               lastLoadedOpenCode2Models = catalog.models;

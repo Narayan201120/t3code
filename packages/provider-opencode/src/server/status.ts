@@ -413,9 +413,13 @@ const modelCatalogFingerprint = (models: ReadonlyArray<OpenCode2Model>): string 
 
 const OPENCODE_2_CATALOG_TIMEOUT = "30 seconds";
 
-export const makeOpenCode2ModelLoader = <E>(
+export const OPENCODE_2_CATALOG_EMPTY_MESSAGE =
+  "OpenCode 2 is running, but it did not list any models yet.";
+export const OPENCODE_2_CATALOG_LOADING_MESSAGE = "OpenCode 2 is still loading its model catalog.";
+
+export const makeOpenCode2ModelLoader = <E, E2>(
   list: Effect.Effect<ReadonlyArray<OpenCode2Model>, E>,
-  ready: Effect.Effect<void>,
+  ready: Effect.Effect<void, E2>,
   lastLoaded: ReadonlyArray<OpenCode2Model> | undefined,
 ): Effect.Effect<OpenCode2ModelCatalog, E> =>
   Effect.gen(function* () {
@@ -597,8 +601,8 @@ const checkOpenCode2 = Effect.fn("checkOpenCode2")(function* (
         ? probe(
             "warning",
             listedModels.length > 0
-              ? "OpenCode 2 is still loading its model catalog."
-              : "OpenCode 2 is running, but it did not list any models yet.",
+              ? OPENCODE_2_CATALOG_LOADING_MESSAGE
+              : OPENCODE_2_CATALOG_EMPTY_MESSAGE,
           )
         : listedModels.length > 0
           ? probe(
