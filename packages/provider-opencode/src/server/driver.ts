@@ -8,7 +8,9 @@ import * as FileSystem from "effect/FileSystem";
 import * as Path from "effect/Path";
 import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
+import * as Sse from "effect/encoding/Sse";
 import * as HttpClient from "effect/http/HttpClient";
+import * as HttpClientError from "effect/http/HttpClientError";
 import * as ChildProcessSpawner from "effect/process/ChildProcessSpawner";
 
 import * as OpenCode2TextGeneration from "./v2/textGeneration.ts";
@@ -68,6 +70,13 @@ import {
 const decodeOpenCodeSettings = Schema.decodeSync(OpenCodeSettings);
 
 const DRIVER_KIND = ProviderDriverKind.make("opencode");
+
+/**
+ * How long to wait for `/api/event` to hand back a stream. A server that accepts
+ * the connection without answering would otherwise hold a provider refresh open
+ * with no deadline at all.
+ */
+const OPENCODE_2_EVENT_SUBSCRIBE_TIMEOUT = "10 seconds";
 
 function isOpenCodeNativeCommandPath(commandPath: string): boolean {
   const normalized = normalizeCommandPath(commandPath);
@@ -297,7 +306,23 @@ export const OpenCodeDriver: ProviderDriver<
       let readyOpenCode2ServerUrl: string | undefined;
       const loadOpenCode2Models = openCode2Server.withConnection(({ client, events, url }) =>
         Effect.gen(function* () {
-          const eventStream = yield* events.pipe(Effect.option);
+          // Opening `/api/event` is a request the server can stall on before it sends
+          // response headers, so it needs its own deadline. Otherwise no catalog
+          // deadline can start and a refresh waits indefinitely.
+          const eventStream: Option.Option<
+            Stream.Stream<
+              OpenCode2Client.OpenCode2StreamEvent,
+              | HttpClientError.HttpClientError
+              | OpenCode2Client.OpenCode2SilentStreamError
+              | Sse.Retry
+              | Sse.SseError
+            >
+          > = yield* events.pipe(
+            Effect.option,
+            Effect.timeoutOption(OPENCODE_2_EVENT_SUBSCRIBE_TIMEOUT),
+            Effect.map(Option.flatten),
+            Effect.orElseSucceed(() => Option.none()),
+          );
           const runLoader = (readiness: OpenCode2CatalogReadiness) =>
             makeOpenCode2ModelLoader(
               loadOpenCode2Catalog(client, host.paths.cwd),

@@ -316,6 +316,57 @@ it.layer(layer)("OpenCodeDriver runtime selection", (it) => {
     }).pipe(Effect.scoped, Effect.provide(TestClock.layer())),
   );
 
+  it.effect("gives up on an event endpoint that never answers", () =>
+    Effect.gen(function* () {
+      const http = HttpClient.make((request) => {
+        const url = new URL(request.url);
+        const location = {
+          directory: url.searchParams.get("location[directory]") ?? "/work",
+        };
+        const json = (body: unknown, status = 200) =>
+          HttpClientResponse.fromWeb(
+            request,
+            new Response(JSON.stringify(body), {
+              status,
+              headers: { "content-type": "application/json" },
+            }),
+          );
+        if (url.pathname === "/api/info") {
+          return Effect.succeed(
+            json({ version: "2.0.18", pid: 2393556, urls: [], paths: { tmp: "/tmp/opencode" } }),
+          );
+        }
+        if (url.pathname === "/api/event") {
+          // Accepts the request and then stalls before sending response headers,
+          // so the subscription never yields a stream.
+          return Effect.never;
+        }
+        if (url.pathname === "/api/model") {
+          return Effect.succeed(json({ location, data: [] }));
+        }
+        if (url.pathname === "/api/provider") {
+          return Effect.succeed(json({ location, data: [] }));
+        }
+        return Effect.succeed(json({ _tag: "NotFoundError", message: "not recorded" }, 404));
+      });
+      const instance = yield* create(
+        { serverUrl: "http://127.0.0.1:4096", serverPassword: "secret" },
+        http,
+      );
+      yield* Effect.yieldNow;
+      const refresh = yield* instance.snapshot.refresh.pipe(Effect.forkChild);
+      yield* Effect.yieldNow;
+      yield* TestClock.adjust("40 seconds");
+
+      const unsettled = yield* Fiber.join(refresh);
+      assert.strictEqual(unsettled.status, "warning");
+      assert.strictEqual(
+        unsettled.message,
+        "OpenCode 2 is running, but it did not list any models yet.",
+      );
+    }).pipe(Effect.scoped, Effect.provide(TestClock.layer())),
+  );
+
   it.effect("lists an OpenCode 2 workspace's own skills and commands from its server", () =>
     Effect.gen(function* () {
       serverStarts.length = 0;
