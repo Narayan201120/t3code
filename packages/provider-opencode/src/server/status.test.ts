@@ -1055,11 +1055,14 @@ it.effect("settles a warm catalog after the event feed ends without an update", 
   }).pipe(Effect.provide(TestClock.layer())),
 );
 
-it.effect("keeps the cached catalog when a ready server lists nothing", () =>
+it.effect("settles an empty read from an already-ready server", () =>
   Effect.gen(function* () {
+    // `Ready` means this server already published a catalog, so its read is
+    // authoritative. Keeping the cache here would report "still loading" forever
+    // and leave removed models listed until T3 restarted.
     const load = makeOpenCode2ModelLoader(Effect.succeed([]), { _tag: "Ready" }, [bigPickle]);
 
-    NodeAssert.deepEqual(yield* load, { _tag: "Unsettled", models: [bigPickle] });
+    NodeAssert.deepEqual(yield* load, { _tag: "Settled", models: [] });
   }).pipe(Effect.provide(TestClock.layer())),
 );
 

@@ -472,11 +472,11 @@ export const makeOpenCode2ModelLoader = <E>(
     }
     const initial = initialRead.value;
     const fallback = initial.length > 0 ? initial : (lastLoaded ?? []);
-    // This server already published a catalog, so its reads are complete.
+    // This server already published a catalog, so its read is authoritative even
+    // when empty: keeping the cache would report "still loading" forever and
+    // leave removed models listed until T3 restarted.
     if (readiness._tag === "Ready") {
-      return initial.length > 0
-        ? { _tag: "Settled", models: initial }
-        : { _tag: "Unsettled", models: fallback };
+      return { _tag: "Settled", models: initial };
     }
     // With no readiness signal, a non-empty catalog that reads the same twice in a
     // row is no longer being built, so it is safe to publish. A single read
