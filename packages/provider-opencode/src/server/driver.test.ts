@@ -303,8 +303,8 @@ it.layer(layer)("OpenCodeDriver runtime selection", (it) => {
       yield* Effect.yieldNow;
       const refresh = yield* instance.snapshot.refresh.pipe(Effect.forkChild);
       yield* Effect.yieldNow;
-      // Far below the 30 second readiness timeout: finishing inside this window
-      // proves the abandoned feed released the loader.
+      // Far below the 30 second readiness timeout: settling inside this window
+      // proves the abandoned feed did not leave the loader waiting.
       yield* TestClock.adjust("5 seconds");
 
       const settled = yield* Fiber.join(refresh);
@@ -315,7 +315,10 @@ it.layer(layer)("OpenCodeDriver runtime selection", (it) => {
         settled.models.map((model) => model.slug),
         ["opencode/big-pickle"],
       );
-      assert.strictEqual(modelReads >= 1, true);
+      // One boot probe plus this refresh, each reading twice: an initial read and
+      // a confirming read. A different count means the settle path changed.
+      assert.strictEqual(modelReads % 2, 0);
+      assert.strictEqual(modelReads >= 2, true);
     }).pipe(Effect.scoped, Effect.provide(TestClock.layer())),
   );
 

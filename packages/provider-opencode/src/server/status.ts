@@ -437,6 +437,25 @@ const modelCatalogIdentity = (models: ReadonlyArray<OpenCode2Model>): string =>
 
 const OPENCODE_2_CATALOG_TIMEOUT = "30 seconds";
 
+/**
+ * Settles a non-empty catalog only once a second read proves it stopped
+ * growing, and otherwise serves the first read as unsettled. An empty first
+ * read has nothing to confirm, so it stays unsettled.
+ */
+const settleWhenCatalogStopsGrowing = <E>(
+  initial: ReadonlyArray<OpenCode2Model>,
+  fallback: ReadonlyArray<OpenCode2Model>,
+  list: Effect.Effect<ReadonlyArray<OpenCode2Model>, E>,
+): Effect.Effect<OpenCode2ModelCatalog, E> =>
+  Effect.gen(function* () {
+    if (initial.length === 0) return { _tag: "Unsettled", models: fallback };
+    const confirmed = yield* list.pipe(Effect.timeoutOption(OPENCODE_2_CATALOG_TIMEOUT));
+    if (confirmed._tag === "None") return { _tag: "Unsettled", models: fallback };
+    return modelCatalogIdentity(confirmed.value) === modelCatalogIdentity(initial)
+      ? { _tag: "Settled", models: confirmed.value }
+      : { _tag: "Unsettled", models: fallback };
+  });
+
 export const OPENCODE_2_CATALOG_EMPTY_MESSAGE =
   "OpenCode 2 is running, but it did not list any models yet.";
 export const OPENCODE_2_CATALOG_LOADING_MESSAGE = "OpenCode 2 is still loading its model catalog.";
@@ -463,23 +482,13 @@ export const makeOpenCode2ModelLoader = <E>(
     // row is no longer being built, so it is safe to publish. A single read
     // cannot prove that: a cold server serves a growing list.
     if (readiness._tag === "Unobservable") {
-      if (initial.length === 0) return { _tag: "Unsettled", models: fallback };
-      const confirmed = yield* list.pipe(Effect.timeoutOption(OPENCODE_2_CATALOG_TIMEOUT));
-      if (confirmed._tag === "None") return { _tag: "Unsettled", models: fallback };
-      return modelCatalogIdentity(confirmed.value) === modelCatalogIdentity(initial)
-        ? { _tag: "Settled", models: confirmed.value }
-        : { _tag: "Unsettled", models: fallback };
+      return yield* settleWhenCatalogStopsGrowing(initial, fallback, list);
     }
     const ready = yield* readiness.ready.pipe(Effect.timeoutOption(OPENCODE_2_CATALOG_TIMEOUT));
     if (ready._tag === "None" || ready.value === "Abandoned") {
       // The feed ended before an update, which says nothing about completeness.
       // Fall back to the same stability check rather than waiting it out.
-      if (initial.length === 0) return { _tag: "Unsettled", models: fallback };
-      const confirmed = yield* list.pipe(Effect.timeoutOption(OPENCODE_2_CATALOG_TIMEOUT));
-      if (confirmed._tag === "None") return { _tag: "Unsettled", models: fallback };
-      return modelCatalogIdentity(confirmed.value) === modelCatalogIdentity(initial)
-        ? { _tag: "Settled", models: confirmed.value }
-        : { _tag: "Unsettled", models: fallback };
+      return yield* settleWhenCatalogStopsGrowing(initial, fallback, list);
     }
 
     const settledRead = yield* list.pipe(Effect.timeoutOption(OPENCODE_2_CATALOG_TIMEOUT));

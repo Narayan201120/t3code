@@ -950,13 +950,22 @@ it.effect("returns unsettled when the event feed ends while the catalog is growi
   }).pipe(Effect.provide(TestClock.layer())),
 );
 
-it.effect("settles a stable read without waiting when no signal exists", () =>
+it.effect("keeps the cached catalog when an empty catalog cannot be confirmed", () =>
   Effect.gen(function* () {
-    const load = makeOpenCode2ModelLoader(Effect.succeed([bigPickle]), { _tag: "Unobservable" }, [
-      bigPickle,
-    ]);
+    let reads = 0;
+    const load = makeOpenCode2ModelLoader(
+      Effect.sync(() => {
+        reads += 1;
+        return [];
+      }),
+      { _tag: "Unobservable" },
+      [bigPickle],
+    );
 
-    NodeAssert.deepEqual(yield* load, { _tag: "Settled", models: [bigPickle] });
+    // An empty read has nothing to confirm, so it stays unsettled and serves the
+    // cache rather than wiping it.
+    NodeAssert.deepEqual(yield* load, { _tag: "Unsettled", models: [bigPickle] });
+    NodeAssert.equal(reads, 1);
   }).pipe(Effect.provide(TestClock.layer())),
 );
 
