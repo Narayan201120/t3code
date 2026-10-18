@@ -402,19 +402,38 @@ export type OpenCode2ModelCatalog =
 /**
  * What the caller knows about the server's catalog when it asks for a read.
  * `Ready` is for a server that already published a catalog, where a fresh read
- * is final and waiting would only stall a warm refresh.
+ * is final and waiting would only stall a warm refresh. `Unobservable` means no
+ * readiness signal exists, so the loader falls back to proving the catalog has
+ * stopped growing.
  */
 export type OpenCode2CatalogReadiness =
   | {
       readonly _tag: "Await";
       /**
        * `Updated` once the server published its catalog. `Abandoned` when no
-       * further signal can arrive, which never settles a read.
+       * further signal can arrive, which never settles a read on its own.
        */
       readonly ready: Effect.Effect<"Updated" | "Abandoned">;
     }
   | { readonly _tag: "Ready" }
   | { readonly _tag: "Unobservable" };
+
+/**
+ * Identity of a catalog for settling purposes. Two reads with the same identity
+ * describe the same catalog, so a non-empty one that repeats is no longer
+ * growing and is safe to publish.
+ */
+const modelCatalogIdentity = (models: ReadonlyArray<OpenCode2Model>): string =>
+  models
+    .map(
+      (model) =>
+        `${model.providerID}/${model.id}\0${model.name}\0${model.providerName ?? ""}\0${model.variants
+          .map((variant) => variant.id)
+          .toSorted()
+          .join(",")}`,
+    )
+    .toSorted()
+    .join("\n");
 
 const OPENCODE_2_CATALOG_TIMEOUT = "30 seconds";
 
@@ -440,12 +459,27 @@ export const makeOpenCode2ModelLoader = <E>(
         ? { _tag: "Settled", models: initial }
         : { _tag: "Unsettled", models: fallback };
     }
-    // Without a catalog-specific readiness signal, integration metadata must
-    // not mark the catalog settled: report the first read as unsettled.
-    if (readiness._tag === "Unobservable") return { _tag: "Unsettled", models: fallback };
+    // With no readiness signal, a non-empty catalog that reads the same twice in a
+    // row is no longer being built, so it is safe to publish. A single read
+    // cannot prove that: a cold server serves a growing list.
+    if (readiness._tag === "Unobservable") {
+      if (initial.length === 0) return { _tag: "Unsettled", models: fallback };
+      const confirmed = yield* list.pipe(Effect.timeoutOption(OPENCODE_2_CATALOG_TIMEOUT));
+      if (confirmed._tag === "None") return { _tag: "Unsettled", models: fallback };
+      return modelCatalogIdentity(confirmed.value) === modelCatalogIdentity(initial)
+        ? { _tag: "Settled", models: confirmed.value }
+        : { _tag: "Unsettled", models: fallback };
+    }
     const ready = yield* readiness.ready.pipe(Effect.timeoutOption(OPENCODE_2_CATALOG_TIMEOUT));
     if (ready._tag === "None" || ready.value === "Abandoned") {
-      return { _tag: "Unsettled", models: fallback };
+      // The feed ended before an update, which says nothing about completeness.
+      // Fall back to the same stability check rather than waiting it out.
+      if (initial.length === 0) return { _tag: "Unsettled", models: fallback };
+      const confirmed = yield* list.pipe(Effect.timeoutOption(OPENCODE_2_CATALOG_TIMEOUT));
+      if (confirmed._tag === "None") return { _tag: "Unsettled", models: fallback };
+      return modelCatalogIdentity(confirmed.value) === modelCatalogIdentity(initial)
+        ? { _tag: "Settled", models: confirmed.value }
+        : { _tag: "Unsettled", models: fallback };
     }
 
     const settledRead = yield* list.pipe(Effect.timeoutOption(OPENCODE_2_CATALOG_TIMEOUT));

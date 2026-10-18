@@ -929,13 +929,15 @@ it.effect("waits for readiness before accepting a catalog that matches the cache
   }).pipe(Effect.provide(TestClock.layer())),
 );
 
-it.effect("returns unsettled when the event feed ends before any update", () =>
+it.effect("returns unsettled when the event feed ends while the catalog is growing", () =>
   Effect.gen(function* () {
-    // A feed that ends or errors before `model.updated` yields `Abandoned`,
-    // which must not settle a read of a possibly partial catalog.
+    // A feed that ends before `model.updated` yields `Abandoned`, which must not
+    // settle a read of a catalog that is still being built.
+    const laterModel = { ...bigPickle, id: "later-model", name: "Later Model" };
+    const replies: Array<ReadonlyArray<OpenCode2Model>> = [[bigPickle], [bigPickle, laterModel]];
     const feedEnded = yield* Deferred.make<"Updated" | "Abandoned">();
     const load = makeOpenCode2ModelLoader(
-      Effect.succeed([bigPickle]),
+      Effect.sync(() => replies.shift() ?? [bigPickle, laterModel]),
       { _tag: "Await", ready: Deferred.await(feedEnded) },
       undefined,
     );
@@ -943,19 +945,18 @@ it.effect("returns unsettled when the event feed ends before any update", () =>
     yield* Effect.yieldNow;
     yield* Deferred.succeed(feedEnded, "Abandoned");
 
+    // Unsettled, serving the first read: the second read is mid-build.
     NodeAssert.deepEqual(yield* Fiber.join(fiber), { _tag: "Unsettled", models: [bigPickle] });
   }).pipe(Effect.provide(TestClock.layer())),
 );
 
-it.effect("returns unsettled without waiting when no readiness signal exists", () =>
+it.effect("settles a stable read without waiting when no signal exists", () =>
   Effect.gen(function* () {
     const load = makeOpenCode2ModelLoader(Effect.succeed([bigPickle]), { _tag: "Unobservable" }, [
       bigPickle,
     ]);
-    const fiber = yield* load.pipe(Effect.forkChild);
-    yield* Effect.yieldNow;
 
-    NodeAssert.deepEqual(yield* Fiber.join(fiber), { _tag: "Unsettled", models: [bigPickle] });
+    NodeAssert.deepEqual(yield* load, { _tag: "Settled", models: [bigPickle] });
   }).pipe(Effect.provide(TestClock.layer())),
 );
 
@@ -991,17 +992,57 @@ it.effect("settles the first read when the server already published a catalog", 
   }).pipe(Effect.provide(TestClock.layer())),
 );
 
-it.effect("reports unsettled for a first read with no readiness signal available", () =>
+it.effect("reports unsettled for a catalog that is still growing", () =>
   Effect.gen(function* () {
+    const laterModel = { ...bigPickle, id: "later-model", name: "Later Model" };
+    const replies: Array<ReadonlyArray<OpenCode2Model>> = [[bigPickle], [bigPickle, laterModel]];
     const load = makeOpenCode2ModelLoader(
-      Effect.succeed([bigPickle]),
+      Effect.sync(() => replies.shift() ?? [bigPickle, laterModel]),
       { _tag: "Unobservable" },
+      undefined,
+    );
+
+    // Still Unsettled, and still serving the first read: the second read is a
+    // catalog mid-build, so publishing it is the bug this PR prevents.
+    NodeAssert.deepEqual(yield* load, { _tag: "Unsettled", models: [bigPickle] });
+  }).pipe(Effect.provide(TestClock.layer())),
+);
+
+it.effect("settles a catalog that stops growing when no signal is available", () =>
+  Effect.gen(function* () {
+    let reads = 0;
+    const load = makeOpenCode2ModelLoader(
+      Effect.sync(() => {
+        reads += 1;
+        return [bigPickle];
+      }),
+      { _tag: "Unobservable" },
+      undefined,
+    );
+
+    NodeAssert.deepEqual(yield* load, { _tag: "Settled", models: [bigPickle] });
+    NodeAssert.equal(reads, 2);
+  }).pipe(Effect.provide(TestClock.layer())),
+);
+
+it.effect("settles a warm catalog after the event feed ends without an update", () =>
+  Effect.gen(function* () {
+    let reads = 0;
+    const feedEnded = yield* Deferred.make<"Updated" | "Abandoned">();
+    const load = makeOpenCode2ModelLoader(
+      Effect.sync(() => {
+        reads += 1;
+        return [bigPickle];
+      }),
+      { _tag: "Await", ready: Deferred.await(feedEnded) },
       undefined,
     );
     const fiber = yield* load.pipe(Effect.forkChild);
     yield* Effect.yieldNow;
+    yield* Deferred.succeed(feedEnded, "Abandoned");
 
-    NodeAssert.deepEqual(yield* Fiber.join(fiber), { _tag: "Unsettled", models: [bigPickle] });
+    NodeAssert.deepEqual(yield* Fiber.join(fiber), { _tag: "Settled", models: [bigPickle] });
+    NodeAssert.equal(reads, 2);
   }).pipe(Effect.provide(TestClock.layer())),
 );
 

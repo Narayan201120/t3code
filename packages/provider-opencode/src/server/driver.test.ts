@@ -232,7 +232,7 @@ it.layer(layer)("OpenCodeDriver runtime selection", (it) => {
       }).pipe(Effect.scoped, Effect.provide(TestClock.layer())),
   );
 
-  it.effect("stops waiting when the event feed ends before any catalog update", () =>
+  it.effect("settles a stable catalog when the event feed ends before any update", () =>
     Effect.gen(function* () {
       let modelReads = 0;
       const http = HttpClient.make((request) => {
@@ -307,11 +307,14 @@ it.layer(layer)("OpenCodeDriver runtime selection", (it) => {
       // proves the abandoned feed released the loader.
       yield* TestClock.adjust("5 seconds");
 
-      const unsettled = yield* Fiber.join(refresh);
-      assert.strictEqual(unsettled.status, "warning");
-      assert.strictEqual(unsettled.message, "OpenCode 2 is still loading its model catalog.");
-      // A settled read would replace the catalog; Unsettled keeps it out of the
-      // ready state even though `model.list` answered.
+      const settled = yield* Fiber.join(refresh);
+      // The feed ended, so no event can arrive; the stable-catalog check settles
+      // this instead of waiting out the readiness timeout.
+      assert.strictEqual(settled.status, "ready");
+      assert.deepStrictEqual(
+        settled.models.map((model) => model.slug),
+        ["opencode/big-pickle"],
+      );
       assert.strictEqual(modelReads >= 1, true);
     }).pipe(Effect.scoped, Effect.provide(TestClock.layer())),
   );
