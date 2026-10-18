@@ -862,15 +862,15 @@ const bigPickle: OpenCode2Model = {
 it.effect("waits past the old five-second limit for the catalog-ready signal", () =>
   Effect.gen(function* () {
     const replies: Array<ReadonlyArray<OpenCode2Model>> = [[], [bigPickle]];
-    const updated = yield* Deferred.make<void>();
+    const updated = yield* Deferred.make<"Updated" | "Abandoned">();
     const signal = yield* Effect.sleep("6 seconds").pipe(
-      Effect.andThen(Deferred.succeed(updated, undefined)),
+      Effect.andThen(Deferred.succeed(updated, "Updated")),
       Effect.forkChild,
     );
     yield* Effect.yieldNow;
     const load = makeOpenCode2ModelLoader(
       Effect.sync(() => replies.shift() ?? [bigPickle]),
-      Deferred.await(updated),
+      { _tag: "Await", ready: Deferred.await(updated) },
       undefined,
     );
     const fiber = yield* load.pipe(Effect.forkChild);
@@ -886,19 +886,19 @@ it.effect("rereads a partial catalog after model.updated", () =>
     const laterModel = { ...bigPickle, id: "later-model", name: "Later Model" };
     const complete = [bigPickle, laterModel];
     const replies: Array<ReadonlyArray<OpenCode2Model>> = [[bigPickle], complete];
-    const updated = yield* Deferred.make<void>();
+    const updated = yield* Deferred.make<"Updated" | "Abandoned">();
     let reads = 0;
     const load = makeOpenCode2ModelLoader(
       Effect.sync(() => {
         reads += 1;
         return replies.shift() ?? complete;
       }),
-      Deferred.await(updated),
+      { _tag: "Await", ready: Deferred.await(updated) },
       undefined,
     );
     const fiber = yield* load.pipe(Effect.forkChild);
     yield* Effect.yieldNow;
-    yield* Deferred.succeed(updated, undefined);
+    yield* Deferred.succeed(updated, "Updated");
 
     NodeAssert.deepEqual(yield* Fiber.join(fiber), { _tag: "Settled", models: complete });
     NodeAssert.equal(reads, 2);
@@ -910,34 +910,38 @@ it.effect("waits for readiness before accepting a catalog that matches the cache
     const laterModel = { ...bigPickle, id: "later-model", name: "Later Model" };
     const complete = [bigPickle, laterModel];
     const replies: Array<ReadonlyArray<OpenCode2Model>> = [[bigPickle], complete];
-    const updated = yield* Deferred.make<void>();
+    const updated = yield* Deferred.make<"Updated" | "Abandoned">();
     let reads = 0;
     const load = makeOpenCode2ModelLoader(
       Effect.sync(() => {
         reads += 1;
         return replies.shift() ?? complete;
       }),
-      Deferred.await(updated),
+      { _tag: "Await", ready: Deferred.await(updated) },
       [bigPickle],
     );
     const fiber = yield* load.pipe(Effect.forkChild);
     yield* Effect.yieldNow;
-    yield* Deferred.succeed(updated, undefined);
+    yield* Deferred.succeed(updated, "Updated");
 
     NodeAssert.deepEqual(yield* Fiber.join(fiber), { _tag: "Settled", models: complete });
     NodeAssert.equal(reads, 2);
   }).pipe(Effect.provide(TestClock.layer())),
 );
 
-it.effect("returns unsettled immediately when readiness fails", () =>
+it.effect("returns unsettled when the event feed ends before any update", () =>
   Effect.gen(function* () {
+    // A feed that ends or errors before `model.updated` yields `Abandoned`,
+    // which must not settle a read of a possibly partial catalog.
+    const feedEnded = yield* Deferred.make<"Updated" | "Abandoned">();
     const load = makeOpenCode2ModelLoader(
       Effect.succeed([bigPickle]),
-      Effect.fail("integration unavailable"),
+      { _tag: "Await", ready: Deferred.await(feedEnded) },
       undefined,
     );
     const fiber = yield* load.pipe(Effect.forkChild);
     yield* Effect.yieldNow;
+    yield* Deferred.succeed(feedEnded, "Abandoned");
 
     NodeAssert.deepEqual(yield* Fiber.join(fiber), { _tag: "Unsettled", models: [bigPickle] });
   }).pipe(Effect.provide(TestClock.layer())),
@@ -945,7 +949,9 @@ it.effect("returns unsettled immediately when readiness fails", () =>
 
 it.effect("returns unsettled without waiting when no readiness signal exists", () =>
   Effect.gen(function* () {
-    const load = makeOpenCode2ModelLoader(Effect.succeed([bigPickle]), undefined, [bigPickle]);
+    const load = makeOpenCode2ModelLoader(Effect.succeed([bigPickle]), { _tag: "Unobservable" }, [
+      bigPickle,
+    ]);
     const fiber = yield* load.pipe(Effect.forkChild);
     yield* Effect.yieldNow;
 
@@ -955,12 +961,55 @@ it.effect("returns unsettled without waiting when no readiness signal exists", (
 
 it.effect("keeps the last settled catalog when readiness times out", () =>
   Effect.gen(function* () {
-    const load = makeOpenCode2ModelLoader(Effect.succeed([]), Effect.never, [bigPickle]);
+    const load = makeOpenCode2ModelLoader(
+      Effect.succeed([]),
+      { _tag: "Await", ready: Effect.never },
+      [bigPickle],
+    );
     const fiber = yield* load.pipe(Effect.forkChild);
     yield* Effect.yieldNow;
     yield* TestClock.adjust("31 seconds");
 
     NodeAssert.deepEqual(yield* Fiber.join(fiber), { _tag: "Unsettled", models: [bigPickle] });
+  }).pipe(Effect.provide(TestClock.layer())),
+);
+
+it.effect("settles the first read when the server already published a catalog", () =>
+  Effect.gen(function* () {
+    let reads = 0;
+    const load = makeOpenCode2ModelLoader(
+      Effect.sync(() => {
+        reads += 1;
+        return [bigPickle];
+      }),
+      { _tag: "Ready" },
+      undefined,
+    );
+
+    NodeAssert.deepEqual(yield* load, { _tag: "Settled", models: [bigPickle] });
+    NodeAssert.equal(reads, 1);
+  }).pipe(Effect.provide(TestClock.layer())),
+);
+
+it.effect("reports unsettled for a first read with no readiness signal available", () =>
+  Effect.gen(function* () {
+    const load = makeOpenCode2ModelLoader(
+      Effect.succeed([bigPickle]),
+      { _tag: "Unobservable" },
+      undefined,
+    );
+    const fiber = yield* load.pipe(Effect.forkChild);
+    yield* Effect.yieldNow;
+
+    NodeAssert.deepEqual(yield* Fiber.join(fiber), { _tag: "Unsettled", models: [bigPickle] });
+  }).pipe(Effect.provide(TestClock.layer())),
+);
+
+it.effect("keeps the cached catalog when a ready server lists nothing", () =>
+  Effect.gen(function* () {
+    const load = makeOpenCode2ModelLoader(Effect.succeed([]), { _tag: "Ready" }, [bigPickle]);
+
+    NodeAssert.deepEqual(yield* load, { _tag: "Unsettled", models: [bigPickle] });
   }).pipe(Effect.provide(TestClock.layer())),
 );
 

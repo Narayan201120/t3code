@@ -28,6 +28,7 @@ import {
   loadOpenCode2Workspace,
   makeOpenCode2ModelLoader,
   makePendingOpenCodeProvider,
+  type OpenCode2CatalogReadiness,
   type OpenCode2Model,
   openCode2CommandsToServerProviderSlashCommands,
   openCode2SkillsToServerProviderSkills,
@@ -290,35 +291,49 @@ export const OpenCodeDriver: ProviderDriver<
       });
       let lastLoadedOpenCode2Models: ReadonlyArray<OpenCode2Model> | undefined;
       let lastLoadedOpenCode2ServerUrl: string | undefined;
+      // A server publishes `model.updated` once while it builds its catalog. Once
+      // seen for this directory, later reads from that server are complete, so a
+      // refresh must not wait for an event that will never arrive again.
+      let readyOpenCode2ServerUrl: string | undefined;
       const loadOpenCode2Models = openCode2Server.withConnection(({ client, events, url }) =>
         Effect.gen(function* () {
           const eventStream = yield* events.pipe(Effect.option);
-          const runLoader = (ready: Effect.Effect<void> | undefined) =>
+          const runLoader = (readiness: OpenCode2CatalogReadiness) =>
             makeOpenCode2ModelLoader(
               loadOpenCode2Catalog(client, host.paths.cwd),
-              ready,
+              readiness,
               url === lastLoadedOpenCode2ServerUrl ? lastLoadedOpenCode2Models : undefined,
             );
 
-          let ready: Effect.Effect<void> | undefined;
-          if (eventStream._tag === "Some") {
+          let readiness: OpenCode2CatalogReadiness =
+            url === readyOpenCode2ServerUrl ? { _tag: "Ready" } : { _tag: "Unobservable" };
+          if (eventStream._tag === "Some" && readiness._tag !== "Ready") {
             // Subscribe before `model.list`; its first response can be empty or partial.
-            const updated = yield* Deferred.make<void>();
+            const updated = yield* Deferred.make<"Updated" | "Abandoned">();
+            const markReady = Effect.sync(() => {
+              readyOpenCode2ServerUrl = url;
+            });
             yield* eventStream.value.pipe(
               Stream.runForEach((event) =>
                 "location" in event &&
                 event.type === "model.updated" &&
                 event.location?.directory === host.paths.cwd
-                  ? Deferred.succeed(updated, undefined).pipe(Effect.asVoid)
+                  ? Deferred.succeed(updated, "Updated").pipe(
+                      Effect.andThen(markReady),
+                      Effect.asVoid,
+                    )
                   : Effect.void,
               ),
+              // A feed that ends or errors can no longer deliver the event, so
+              // release the waiter instead of leaving it on the timeout.
+              Effect.onExit(() => Deferred.succeed(updated, "Abandoned")),
               Effect.ignore,
               Effect.forkScoped,
             );
-            ready = Deferred.await(updated);
+            readiness = { _tag: "Await", ready: Deferred.await(updated) };
           }
 
-          const catalog = yield* runLoader(ready);
+          const catalog = yield* runLoader(readiness);
           if (catalog._tag === "Settled") {
             lastLoadedOpenCode2Models = catalog.models;
             lastLoadedOpenCode2ServerUrl = url;

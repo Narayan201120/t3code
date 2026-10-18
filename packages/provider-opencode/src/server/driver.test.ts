@@ -141,19 +141,25 @@ it.layer(layer)("OpenCodeDriver runtime selection", (it) => {
           }
           if (url.pathname === "/api/event") {
             eventSubscriptions += 1;
-            if (eventSubscriptions > 1) return Effect.succeed(json({}, 404));
-
+            // Only the first subscription sees the update. A warm server that
+            // has already published its catalog will not emit another one, so
+            // later subscriptions stay open and silent.
+            const emitUpdate = eventSubscriptions === 1;
             const body = new ReadableStream<Uint8Array>({
               start(controller) {
-                const event = {
-                  id: "evt_model-update",
-                  created: 1,
-                  type: "model.updated",
-                  location: { directory: host.paths.cwd },
-                  data: {},
-                };
-                controller.enqueue(new TextEncoder().encode(`data: ${JSON.stringify(event)}\n\n`));
-                controller.close();
+                if (emitUpdate) {
+                  const event = {
+                    id: "evt_model-update",
+                    created: 1,
+                    type: "model.updated",
+                    location: { directory: host.paths.cwd },
+                    data: {},
+                  };
+                  controller.enqueue(
+                    new TextEncoder().encode(`data: ${JSON.stringify(event)}\n\n`),
+                  );
+                  controller.close();
+                }
               },
             });
             return Effect.succeed(
@@ -165,12 +171,9 @@ it.layer(layer)("OpenCodeDriver runtime selection", (it) => {
           }
           if (url.pathname === "/api/model") {
             modelListReads += 1;
-            const data =
-              modelListReads === 1
-                ? [firstModel]
-                : modelListReads === 2
-                  ? [firstModel, laterModel]
-                  : [];
+            // The first read is partial, the post-update read is complete, and
+            // every later read repeats the complete catalog.
+            const data = modelListReads === 1 ? [firstModel] : [firstModel, laterModel];
             const response = json({ location, data });
             return modelListReads === 2
               ? Deferred.succeed(secondModelRead, undefined).pipe(Effect.as(response))
@@ -215,17 +218,102 @@ it.layer(layer)("OpenCodeDriver runtime selection", (it) => {
         );
         assert.strictEqual(integrationListReads, 0);
 
-        const unsettled = yield* instance.snapshot.refresh;
-        assert.strictEqual(unsettled.status, "warning");
-        assert.strictEqual(unsettled.message, "OpenCode 2 is still loading its model catalog.");
+        // The server already signalled readiness once, so a refresh must settle
+        // immediately instead of waiting out the readiness timeout.
+        const refreshed = yield* instance.snapshot.refresh;
+        assert.strictEqual(refreshed.status, "ready");
         assert.deepStrictEqual(
-          unsettled.models.map((model) => model.slug),
+          refreshed.models.map((model) => model.slug),
           settled.models.map((model) => model.slug),
         );
         assert.strictEqual(eventSubscriptions, 2);
         assert.strictEqual(modelListReads, 3);
         assert.strictEqual(integrationListReads, 0);
       }).pipe(Effect.scoped, Effect.provide(TestClock.layer())),
+  );
+
+  it.effect("stops waiting when the event feed ends before any catalog update", () =>
+    Effect.gen(function* () {
+      let modelReads = 0;
+      const http = HttpClient.make((request) => {
+        const url = new URL(request.url);
+        const location = {
+          directory: url.searchParams.get("location[directory]") ?? "/work",
+        };
+        const json = (body: unknown, status = 200) =>
+          HttpClientResponse.fromWeb(
+            request,
+            new Response(JSON.stringify(body), {
+              status,
+              headers: { "content-type": "application/json" },
+            }),
+          );
+        if (url.pathname === "/api/info") {
+          return Effect.succeed(
+            json({ version: "2.0.18", pid: 2393556, urls: [], paths: { tmp: "/tmp/opencode" } }),
+          );
+        }
+        if (url.pathname === "/api/event") {
+          // A feed that ends at once can never deliver `model.updated`, so the
+          // loader must give up rather than sit on the readiness timeout.
+          const body = new ReadableStream<Uint8Array>({
+            start(controller) {
+              controller.close();
+            },
+          });
+          return Effect.succeed(
+            HttpClientResponse.fromWeb(
+              request,
+              new Response(body, { headers: { "content-type": "text/event-stream" } }),
+            ),
+          );
+        }
+        if (url.pathname === "/api/model") {
+          modelReads += 1;
+          return Effect.succeed(
+            json({
+              location,
+              data: [
+                {
+                  id: "big-pickle",
+                  modelID: "big-pickle",
+                  providerID: "opencode",
+                  name: "Big Pickle",
+                  capabilities: { tools: true, input: ["text"], output: ["text"] },
+                  variants: [],
+                  time: { released: 0 },
+                  cost: [],
+                  status: "active",
+                  enabled: true,
+                  limit: { context: 200_000, output: 32_000 },
+                },
+              ],
+            }),
+          );
+        }
+        if (url.pathname === "/api/provider") {
+          return Effect.succeed(json({ location, data: [] }));
+        }
+        return Effect.succeed(json({ _tag: "NotFoundError", message: "not recorded" }, 404));
+      });
+      const instance = yield* create(
+        { serverUrl: "http://127.0.0.1:4096", serverPassword: "secret" },
+        http,
+      );
+      yield* Effect.yieldNow;
+      const refresh = yield* instance.snapshot.refresh.pipe(Effect.forkChild);
+      yield* Effect.yieldNow;
+      // Far below the 30 second readiness timeout: finishing inside this window
+      // proves the abandoned feed released the loader.
+      yield* TestClock.adjust("5 seconds");
+
+      const unsettled = yield* Fiber.join(refresh);
+      assert.strictEqual(unsettled.status, "warning");
+      assert.strictEqual(unsettled.message, "OpenCode 2 is still loading its model catalog.");
+      // A settled read would replace the catalog; Unsettled keeps it out of the
+      // ready state even though `model.list` answered.
+      assert.strictEqual(modelReads >= 1, true);
+    }).pipe(Effect.scoped, Effect.provide(TestClock.layer())),
   );
 
   it.effect("lists an OpenCode 2 workspace's own skills and commands from its server", () =>

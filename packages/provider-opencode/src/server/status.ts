@@ -399,15 +399,32 @@ export type OpenCode2ModelCatalog =
   | { readonly _tag: "Settled"; readonly models: ReadonlyArray<OpenCode2Model> }
   | { readonly _tag: "Unsettled"; readonly models: ReadonlyArray<OpenCode2Model> };
 
+/**
+ * What the caller knows about the server's catalog when it asks for a read.
+ * `Ready` is for a server that already published a catalog, where a fresh read
+ * is final and waiting would only stall a warm refresh.
+ */
+export type OpenCode2CatalogReadiness =
+  | {
+      readonly _tag: "Await";
+      /**
+       * `Updated` once the server published its catalog. `Abandoned` when no
+       * further signal can arrive, which never settles a read.
+       */
+      readonly ready: Effect.Effect<"Updated" | "Abandoned">;
+    }
+  | { readonly _tag: "Ready" }
+  | { readonly _tag: "Unobservable" };
+
 const OPENCODE_2_CATALOG_TIMEOUT = "30 seconds";
 
 export const OPENCODE_2_CATALOG_EMPTY_MESSAGE =
   "OpenCode 2 is running, but it did not list any models yet.";
 export const OPENCODE_2_CATALOG_LOADING_MESSAGE = "OpenCode 2 is still loading its model catalog.";
 
-export const makeOpenCode2ModelLoader = <E, E2>(
+export const makeOpenCode2ModelLoader = <E>(
   list: Effect.Effect<ReadonlyArray<OpenCode2Model>, E>,
-  ready: Effect.Effect<void, E2> | undefined,
+  readiness: OpenCode2CatalogReadiness,
   lastLoaded: ReadonlyArray<OpenCode2Model> | undefined,
 ): Effect.Effect<OpenCode2ModelCatalog, E> =>
   Effect.gen(function* () {
@@ -417,14 +434,17 @@ export const makeOpenCode2ModelLoader = <E, E2>(
     }
     const initial = initialRead.value;
     const fallback = initial.length > 0 ? initial : (lastLoaded ?? []);
+    // This server already published a catalog, so its reads are complete.
+    if (readiness._tag === "Ready") {
+      return initial.length > 0
+        ? { _tag: "Settled", models: initial }
+        : { _tag: "Unsettled", models: fallback };
+    }
     // Without a catalog-specific readiness signal, integration metadata must
     // not mark the catalog settled: report the first read as unsettled.
-    if (ready === undefined) return { _tag: "Unsettled", models: fallback };
-    const readiness = yield* ready.pipe(
-      Effect.timeoutOption(OPENCODE_2_CATALOG_TIMEOUT),
-      Effect.option,
-    );
-    if (readiness._tag === "None" || readiness.value._tag === "None") {
+    if (readiness._tag === "Unobservable") return { _tag: "Unsettled", models: fallback };
+    const ready = yield* readiness.ready.pipe(Effect.timeoutOption(OPENCODE_2_CATALOG_TIMEOUT));
+    if (ready._tag === "None" || ready.value === "Abandoned") {
       return { _tag: "Unsettled", models: fallback };
     }
 
