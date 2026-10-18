@@ -399,18 +399,6 @@ export type OpenCode2ModelCatalog =
   | { readonly _tag: "Settled"; readonly models: ReadonlyArray<OpenCode2Model> }
   | { readonly _tag: "Unsettled"; readonly models: ReadonlyArray<OpenCode2Model> };
 
-const modelCatalogFingerprint = (models: ReadonlyArray<OpenCode2Model>): string =>
-  models
-    .map(
-      (model) =>
-        `${model.providerID}/${model.id}\0${model.name}\0${model.providerName ?? ""}\0${model.variants
-          .map((variant) => variant.id)
-          .toSorted()
-          .join(",")}`,
-    )
-    .toSorted()
-    .join("\n");
-
 const OPENCODE_2_CATALOG_TIMEOUT = "30 seconds";
 
 export const OPENCODE_2_CATALOG_EMPTY_MESSAGE =
@@ -428,13 +416,6 @@ export const makeOpenCode2ModelLoader = <E, E2>(
       return { _tag: "Unsettled", models: lastLoaded ?? [] };
     }
     const initial = initialRead.value;
-    if (
-      lastLoaded !== undefined &&
-      modelCatalogFingerprint(initial) === modelCatalogFingerprint(lastLoaded)
-    ) {
-      return { _tag: "Settled", models: initial };
-    }
-
     const fallback = initial.length > 0 ? initial : (lastLoaded ?? []);
     // Without a catalog-specific readiness signal, integration metadata must
     // not mark the catalog settled: report the first read as unsettled.

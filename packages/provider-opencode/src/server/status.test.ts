@@ -8,6 +8,7 @@ import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
+import * as Path from "effect/Path";
 import * as Schema from "effect/Schema";
 import * as TestClock from "effect/testing/TestClock";
 import * as HttpClient from "effect/http/HttpClient";
@@ -42,6 +43,10 @@ const DEFAULT_VERSION_STDOUT = "opencode 1.14.19\n";
 it.effect("reads Go limits with the instance's XDG credentials and preserves reset times", () =>
   Effect.gen(function* () {
     const resetsAt = "2026-09-17T12:00:00.000Z";
+    const authPath = yield* Path.Path.pipe(
+      Effect.map((path) => path.join("/instance/data", "opencode", "auth.json")),
+      Effect.provide(NodeServices.layer),
+    );
     const limits = yield* readOpenCodeGoUsageLimits({
       enabled: true,
       serverUrl: "",
@@ -51,7 +56,7 @@ it.effect("reads Go limits with the instance's XDG credentials and preserves res
         FileSystem.FileSystem,
         FileSystem.makeNoop({
           readFileString: (path) => {
-            NodeAssert.equal(path, "/instance/data/opencode/auth.json");
+            NodeAssert.equal(path, authPath);
             return Effect.succeed(
               JSON.stringify({ "opencode-go": { type: "api", key: "instance-key" } }),
             );
@@ -900,6 +905,30 @@ it.effect("rereads a partial catalog after model.updated", () =>
   }).pipe(Effect.provide(TestClock.layer())),
 );
 
+it.effect("waits for readiness before accepting a catalog that matches the cache", () =>
+  Effect.gen(function* () {
+    const laterModel = { ...bigPickle, id: "later-model", name: "Later Model" };
+    const complete = [bigPickle, laterModel];
+    const replies: Array<ReadonlyArray<OpenCode2Model>> = [[bigPickle], complete];
+    const updated = yield* Deferred.make<void>();
+    let reads = 0;
+    const load = makeOpenCode2ModelLoader(
+      Effect.sync(() => {
+        reads += 1;
+        return replies.shift() ?? complete;
+      }),
+      Deferred.await(updated),
+      [bigPickle],
+    );
+    const fiber = yield* load.pipe(Effect.forkChild);
+    yield* Effect.yieldNow;
+    yield* Deferred.succeed(updated, undefined);
+
+    NodeAssert.deepEqual(yield* Fiber.join(fiber), { _tag: "Settled", models: complete });
+    NodeAssert.equal(reads, 2);
+  }).pipe(Effect.provide(TestClock.layer())),
+);
+
 it.effect("returns unsettled immediately when readiness fails", () =>
   Effect.gen(function* () {
     const load = makeOpenCode2ModelLoader(
@@ -916,7 +945,7 @@ it.effect("returns unsettled immediately when readiness fails", () =>
 
 it.effect("returns unsettled without waiting when no readiness signal exists", () =>
   Effect.gen(function* () {
-    const load = makeOpenCode2ModelLoader(Effect.succeed([bigPickle]), undefined, undefined);
+    const load = makeOpenCode2ModelLoader(Effect.succeed([bigPickle]), undefined, [bigPickle]);
     const fiber = yield* load.pipe(Effect.forkChild);
     yield* Effect.yieldNow;
 

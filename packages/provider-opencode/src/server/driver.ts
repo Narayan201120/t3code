@@ -290,58 +290,41 @@ export const OpenCodeDriver: ProviderDriver<
       });
       let lastLoadedOpenCode2Models: ReadonlyArray<OpenCode2Model> | undefined;
       let lastLoadedOpenCode2ServerUrl: string | undefined;
-      const loadOpenCode2Models = openCode2Server.withConnection(
-        ({ client, events, external, url }) =>
-          Effect.gen(function* () {
-            const location = { directory: host.paths.cwd };
-            const eventStream = yield* events.pipe(Effect.option);
-            const runLoader = <E2>(ready: Effect.Effect<void, E2> | undefined) =>
-              makeOpenCode2ModelLoader(
-                loadOpenCode2Catalog(client, host.paths.cwd),
-                ready,
-                !external && url === lastLoadedOpenCode2ServerUrl
-                  ? lastLoadedOpenCode2Models
-                  : undefined,
-              );
-
-            if (!external && eventStream._tag === "Some") {
-              // Subscribe before `model.list`; its first response can be empty or partial.
-              const updated = yield* Deferred.make<void>();
-              yield* eventStream.value.pipe(
-                Stream.runForEach((event) =>
-                  "location" in event &&
-                  event.type === "model.updated" &&
-                  event.location?.directory === host.paths.cwd
-                    ? Deferred.succeed(updated, undefined).pipe(Effect.asVoid)
-                    : Effect.void,
-                ),
-                Effect.ignore,
-                Effect.forkScoped,
-              );
-              const catalog = yield* runLoader(Deferred.await(updated));
-              if (catalog._tag === "Settled") {
-                lastLoadedOpenCode2Models = catalog.models;
-                lastLoadedOpenCode2ServerUrl = url;
-              }
-              return catalog;
-            }
-
-            if (!external) {
-              // Managed server with no event stream: integration metadata
-              // cannot vouch for catalog readiness, so report the first read
-              // as unsettled and keep the cached catalog.
-              return yield* runLoader(undefined);
-            }
-
-            const catalog = yield* runLoader(
-              client.integration.list({ location }).pipe(Effect.asVoid),
+      const loadOpenCode2Models = openCode2Server.withConnection(({ client, events, url }) =>
+        Effect.gen(function* () {
+          const eventStream = yield* events.pipe(Effect.option);
+          const runLoader = (ready: Effect.Effect<void> | undefined) =>
+            makeOpenCode2ModelLoader(
+              loadOpenCode2Catalog(client, host.paths.cwd),
+              ready,
+              url === lastLoadedOpenCode2ServerUrl ? lastLoadedOpenCode2Models : undefined,
             );
-            if (catalog._tag === "Settled") {
-              lastLoadedOpenCode2Models = catalog.models;
-              lastLoadedOpenCode2ServerUrl = url;
-            }
-            return catalog;
-          }).pipe(Effect.scoped),
+
+          let ready: Effect.Effect<void> | undefined;
+          if (eventStream._tag === "Some") {
+            // Subscribe before `model.list`; its first response can be empty or partial.
+            const updated = yield* Deferred.make<void>();
+            yield* eventStream.value.pipe(
+              Stream.runForEach((event) =>
+                "location" in event &&
+                event.type === "model.updated" &&
+                event.location?.directory === host.paths.cwd
+                  ? Deferred.succeed(updated, undefined).pipe(Effect.asVoid)
+                  : Effect.void,
+              ),
+              Effect.ignore,
+              Effect.forkScoped,
+            );
+            ready = Deferred.await(updated);
+          }
+
+          const catalog = yield* runLoader(ready);
+          if (catalog._tag === "Settled") {
+            lastLoadedOpenCode2Models = catalog.models;
+            lastLoadedOpenCode2ServerUrl = url;
+          }
+          return catalog;
+        }).pipe(Effect.scoped),
       );
       const listOpenCode2Workspace = (cwd: string) =>
         openCode2Server.withConnection(({ client, events }) =>

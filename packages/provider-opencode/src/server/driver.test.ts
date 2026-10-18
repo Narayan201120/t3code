@@ -8,14 +8,18 @@ import { assert, it } from "@effect/vitest";
 import { ProviderInstanceId } from "@t3tools/contracts";
 import type { OpenCodeSettings } from "../settings.ts";
 import * as HostProcess from "@t3tools/shared/HostProcess";
+import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
+import * as Stream from "effect/Stream";
 import * as TestClock from "effect/testing/TestClock";
 import * as HttpClient from "effect/http/HttpClient";
+import * as HttpClientResponse from "effect/http/HttpClientResponse";
 import * as ChildProcessSpawner from "effect/process/ChildProcessSpawner";
 
 import * as ProviderLatestVersions from "@t3tools/provider-core/server/ProviderLatestVersions";
+import * as ProviderHost from "@t3tools/provider-core/server/ProviderHost";
 import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
 import * as McpProviderSessions from "@t3tools/provider-core/server/McpProviderSessions";
 import * as ProviderEventLoggers from "@t3tools/provider-core/server/ProviderEventLoggers";
@@ -84,6 +88,144 @@ it.layer(layer)("OpenCodeDriver runtime selection", (it) => {
       );
       assert.deepStrictEqual(serverStarts, ["start"]);
     }).pipe(Effect.scoped),
+  );
+
+  it.effect(
+    "uses external model events for catalog readiness and keeps cached models without them",
+    () =>
+      Effect.gen(function* () {
+        const host = yield* ProviderHost.ProviderHost;
+        const secondModelRead = yield* Deferred.make<void>();
+        const requestedPaths: Array<string> = [];
+        let modelListReads = 0;
+        let eventSubscriptions = 0;
+        let integrationListReads = 0;
+        const firstModel = {
+          id: "big-pickle",
+          modelID: "big-pickle",
+          providerID: "opencode",
+          name: "Big Pickle",
+          capabilities: { tools: true, input: ["text"], output: ["text"] },
+          variants: [],
+          time: { released: 0 },
+          cost: [],
+          status: "active",
+          enabled: true,
+          limit: { context: 200_000, output: 32_000 },
+        };
+        const laterModel = {
+          ...firstModel,
+          id: "later-model",
+          modelID: "later-model",
+          name: "Later Model",
+        };
+        const http = HttpClient.make((request) => {
+          const url = new URL(request.url);
+          requestedPaths.push(url.pathname);
+          const location = {
+            directory: url.searchParams.get("location[directory]") ?? "/work",
+          };
+          const json = (body: unknown, status = 200) =>
+            HttpClientResponse.fromWeb(
+              request,
+              new Response(JSON.stringify(body), {
+                status,
+                headers: { "content-type": "application/json" },
+              }),
+            );
+
+          if (url.pathname === "/api/info") {
+            return Effect.succeed(
+              json({ version: "2.0.18", pid: 2393556, urls: [], paths: { tmp: "/tmp/opencode" } }),
+            );
+          }
+          if (url.pathname === "/api/event") {
+            eventSubscriptions += 1;
+            if (eventSubscriptions > 1) return Effect.succeed(json({}, 404));
+
+            const body = new ReadableStream<Uint8Array>({
+              start(controller) {
+                const event = {
+                  id: "evt_model-update",
+                  created: 1,
+                  type: "model.updated",
+                  location: { directory: host.paths.cwd },
+                  data: {},
+                };
+                controller.enqueue(new TextEncoder().encode(`data: ${JSON.stringify(event)}\n\n`));
+                controller.close();
+              },
+            });
+            return Effect.succeed(
+              HttpClientResponse.fromWeb(
+                request,
+                new Response(body, { headers: { "content-type": "text/event-stream" } }),
+              ),
+            );
+          }
+          if (url.pathname === "/api/model") {
+            modelListReads += 1;
+            const data =
+              modelListReads === 1
+                ? [firstModel]
+                : modelListReads === 2
+                  ? [firstModel, laterModel]
+                  : [];
+            const response = json({ location, data });
+            return modelListReads === 2
+              ? Deferred.succeed(secondModelRead, undefined).pipe(Effect.as(response))
+              : Effect.succeed(response);
+          }
+          if (url.pathname === "/api/provider") {
+            return Effect.succeed(json({ location, data: [] }));
+          }
+          if (url.pathname === "/api/integration") {
+            integrationListReads += 1;
+            return Effect.succeed(json({ _tag: "NotFoundError", message: "not recorded" }, 404));
+          }
+          return Effect.succeed(json({ _tag: "NotFoundError", message: "not recorded" }, 404));
+        });
+        const instance = yield* create(
+          { serverUrl: "http://127.0.0.1:4096", serverPassword: "secret" },
+          http,
+        );
+        const changed = yield* Stream.runHead(instance.snapshot.streamChanges).pipe(
+          Effect.forkChild,
+        );
+        const reread = yield* Deferred.await(secondModelRead).pipe(
+          Effect.timeoutOption("5 seconds"),
+          Effect.map((result) => result._tag === "Some"),
+          Effect.forkChild,
+        );
+        yield* Effect.yieldNow;
+        yield* TestClock.adjust("6 seconds");
+        assert.isTrue(
+          yield* Fiber.join(reread),
+          `model.updated did not trigger a reread: ${requestedPaths}`,
+        );
+
+        const settledOption = yield* Fiber.join(changed);
+        if (settledOption._tag === "None")
+          throw new Error("OpenCode status did not publish a snapshot.");
+        const settled = settledOption.value;
+        assert.strictEqual(settled.status, "ready");
+        assert.deepStrictEqual(
+          settled.models.map((model) => model.slug),
+          ["opencode/big-pickle", "opencode/later-model"],
+        );
+        assert.strictEqual(integrationListReads, 0);
+
+        const unsettled = yield* instance.snapshot.refresh;
+        assert.strictEqual(unsettled.status, "warning");
+        assert.strictEqual(unsettled.message, "OpenCode 2 is still loading its model catalog.");
+        assert.deepStrictEqual(
+          unsettled.models.map((model) => model.slug),
+          settled.models.map((model) => model.slug),
+        );
+        assert.strictEqual(eventSubscriptions, 2);
+        assert.strictEqual(modelListReads, 3);
+        assert.strictEqual(integrationListReads, 0);
+      }).pipe(Effect.scoped, Effect.provide(TestClock.layer())),
   );
 
   it.effect("lists an OpenCode 2 workspace's own skills and commands from its server", () =>
