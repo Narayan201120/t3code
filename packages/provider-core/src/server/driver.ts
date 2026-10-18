@@ -43,6 +43,13 @@ export interface ProviderInstance {
   readonly instanceId: ProviderInstanceId;
   readonly driverKind: ProviderDriverKind;
   readonly continuationIdentity: ProviderContinuationIdentity;
+  /**
+   * Identity of the source this instance reads models from. Two instances can
+   * share an `instanceId` and a `continuationIdentity` while reading different
+   * servers, so anything that keeps a previous catalog across a rebuild has to
+   * compare this before treating the old models as still current.
+   */
+  readonly modelSourceIdentity?: string | undefined;
   readonly displayName: string | undefined;
   readonly accentColor?: string | undefined;
   readonly enabled: boolean;

@@ -542,6 +542,10 @@ export const OpenCodeDriver: ProviderDriver<
         instanceId,
         driverKind: DRIVER_KIND,
         continuationIdentity,
+        // The catalog comes from this endpoint, so a change to it makes the
+        // previous models a different server's catalog rather than a stale copy
+        // of this one.
+        modelSourceIdentity: effectiveConfig.serverUrl.trim(),
         displayName,
         accentColor,
         enabled,

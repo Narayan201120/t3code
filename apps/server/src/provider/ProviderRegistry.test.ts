@@ -2308,6 +2308,156 @@ it.layer(
       }),
     );
 
+    it.effect("drops retained models when a rebuild points at a different model source", () =>
+      Effect.gen(function* () {
+        const driver = ProviderDriverKind.make("opencode");
+        const instanceId = ProviderInstanceId.make("opencode");
+        const readyProvider = {
+          instanceId,
+          driver,
+          status: "ready",
+          enabled: true,
+          installed: true,
+          auth: { status: "authenticated" },
+          checkedAt: "2026-06-10T00:00:00.000Z",
+          version: "2.0.0",
+          models: [
+            {
+              slug: "opencode/big-pickle",
+              name: "Big Pickle",
+              subProvider: "OpenCode",
+              isCustom: false,
+              capabilities: null,
+            },
+          ],
+          slashCommands: [],
+          skills: [],
+        } as const satisfies ServerProvider;
+        // A catalog still loading reports a warning and no models. Retention keeps
+        // the previous models while it is pending, which is only correct when the
+        // pending catalog comes from the same server.
+        const loadingProvider = {
+          ...readyProvider,
+          status: "warning",
+          auth: { status: "unknown" },
+          checkedAt: "2026-06-10T00:01:00.000Z",
+          models: [],
+          message: "OpenCode 2 is still loading its model catalog.",
+        } satisfies ServerProvider;
+        const registryChanges = yield* PubSub.unbounded<void>();
+        const makeInstance = (
+          provider: ServerProvider,
+          modelSourceIdentity: string,
+        ): ProviderInstance => ({
+          instanceId,
+          driverKind: driver,
+          continuationIdentity: {
+            driverKind: driver,
+            continuationKey: "opencode:instance:opencode",
+          },
+          modelSourceIdentity,
+          displayName: undefined,
+          enabled: true,
+          snapshot: {
+            resolveMaintenance: () =>
+              Effect.succeed(
+                makeManualOnlyProviderMaintenanceCapabilities({
+                  provider: driver,
+                  packageName: null,
+                }),
+              ),
+            getSnapshot: Effect.succeed(provider),
+            refresh: Effect.succeed(provider),
+            streamChanges: Stream.empty,
+            applyUsageLimits: () => Effect.void,
+          },
+          orchestrationAdapter: {} as ProviderInstance["orchestrationAdapter"],
+          textGeneration: {} as ProviderInstance["textGeneration"],
+        });
+        const instancesRef = yield* Ref.make<ReadonlyArray<ProviderInstance>>([
+          makeInstance(readyProvider, "http://127.0.0.1:4096"),
+        ]);
+        const layerInstanceRegistry = Layer.succeed(
+          ProviderInstanceRegistry.ProviderInstanceRegistry,
+          {
+            getInstance: (requestedId) =>
+              Ref.get(instancesRef).pipe(
+                Effect.map((instances) =>
+                  instances.find((instance) => instance.instanceId === requestedId),
+                ),
+              ),
+            listInstances: Ref.get(instancesRef),
+            listUnavailable: Effect.succeed([]),
+            streamChanges: Stream.fromPubSub(registryChanges),
+            subscribeChanges: PubSub.subscribe(registryChanges),
+          },
+        );
+        const scope = yield* Scope.make();
+        yield* Effect.addFinalizer(() => Scope.close(scope, Exit.void));
+        const runtimeServices = yield* Layer.build(
+          ProviderRegistry.layer.pipe(
+            Layer.provideMerge(layerInstanceRegistry),
+            Layer.provideMerge(
+              ServerConfig.layerTest(process.cwd(), {
+                prefix: "t3-provider-registry-model-source-",
+              }),
+            ),
+            Layer.provideMerge(NodeServices.layer),
+          ),
+        ).pipe(Scope.provide(scope));
+
+        yield* Effect.gen(function* () {
+          const registry = yield* ProviderRegistry.ProviderRegistry;
+          const settleOn = (expectedCheckedAt: string) =>
+            Effect.gen(function* () {
+              let current = yield* registry.getProviders;
+              for (
+                let attempt = 0;
+                attempt < 5000 && current[0]?.checkedAt !== expectedCheckedAt;
+                attempt += 1
+              ) {
+                // `it.effect` runs on a test clock, so this must not sleep:
+                // real-time sleeps never advance here.
+                yield* Effect.yieldNow;
+                current = yield* registry.getProviders;
+              }
+              assert.strictEqual(
+                current[0]?.checkedAt,
+                expectedCheckedAt,
+                "the rebuilt instance was never published",
+              );
+              return current;
+            });
+
+          const publishRebuild = (instance: ProviderInstance) =>
+            Effect.gen(function* () {
+              yield* Ref.set(instancesRef, [instance]);
+              yield* PubSub.publish(registryChanges, undefined);
+            });
+
+          yield* publishRebuild(makeInstance(readyProvider, "http://127.0.0.1:4096"));
+          const published = yield* settleOn(readyProvider.checkedAt);
+          assert.deepStrictEqual(published[0]?.models, readyProvider.models);
+
+          // Same server, still loading: the pending catalog is a continuation of
+          // the one already listed, so its models stay visible.
+          yield* publishRebuild(makeInstance(loadingProvider, "http://127.0.0.1:4096"));
+          const sameSource = yield* settleOn(loadingProvider.checkedAt);
+          assert.deepStrictEqual(sameSource[0]?.models, readyProvider.models);
+
+          // Different server, still loading: the pending catalog belongs to a
+          // server whose models were never listed, so the old ones must go.
+          const otherSourceProvider = {
+            ...loadingProvider,
+            checkedAt: "2026-06-10T00:02:00.000Z",
+          } satisfies ServerProvider;
+          yield* publishRebuild(makeInstance(otherSourceProvider, "http://127.0.0.1:5099"));
+          const otherSource = yield* settleOn(otherSourceProvider.checkedAt);
+          assert.deepStrictEqual(otherSource[0]?.models, []);
+        }).pipe(Effect.provide(runtimeServices));
+      }),
+    );
+
     it.effect("refreshes OpenCode catalogs and preserves other providers", () =>
       Effect.gen(function* () {
         const codexDriver = ProviderDriverKind.make("codex");
