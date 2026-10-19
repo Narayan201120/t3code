@@ -11,6 +11,7 @@ import * as HostProcess from "@t3tools/shared/HostProcess";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
+import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Stream from "effect/Stream";
 import * as TestClock from "effect/testing/TestClock";
@@ -19,7 +20,6 @@ import * as HttpClientResponse from "effect/http/HttpClientResponse";
 import * as ChildProcessSpawner from "effect/process/ChildProcessSpawner";
 
 import * as ProviderLatestVersions from "@t3tools/provider-core/server/ProviderLatestVersions";
-import * as ProviderHost from "@t3tools/provider-core/server/ProviderHost";
 import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
 import * as McpProviderSessions from "@t3tools/provider-core/server/McpProviderSessions";
 import * as ProviderEventLoggers from "@t3tools/provider-core/server/ProviderEventLoggers";
@@ -74,6 +74,61 @@ const create = (config: Partial<OpenCodeSettings>, http: HttpClient.HttpClient) 
 
 const noHttp = HttpClient.make(() => Effect.die("A local binary must not be probed over HTTP"));
 
+const catalogModel = {
+  id: "big-pickle",
+  modelID: "big-pickle",
+  providerID: "opencode",
+  name: "Big Pickle",
+  capabilities: { tools: true, input: ["text"], output: ["text"] },
+  variants: [],
+  time: { released: 0 },
+  cost: [],
+  status: "active",
+  enabled: true,
+  limit: { context: 200_000, output: 32_000 },
+};
+
+// OpenCode 2.0.28 waits for plugin activation in model.list; activation still
+// pending after five seconds returns ServiceUnavailableError, not a partial list.
+const catalogServer = (
+  models: Effect.Effect<{ data: Array<typeof catalogModel>; status?: number }>,
+  events: Stream.Stream<Uint8Array>,
+) =>
+  HttpClient.make((request) =>
+    Effect.gen(function* () {
+      const url = new URL(request.url);
+      const location = { directory: url.searchParams.get("location[directory]") ?? "/work" };
+      const result = url.pathname === "/api/model" ? yield* models : undefined;
+      const body =
+        url.pathname === "/api/info"
+          ? { version: "2.0.28", pid: 2393556, urls: [], paths: { tmp: "/tmp/opencode" } }
+          : result?.status === 503
+            ? {
+                _tag: "ServiceUnavailableError",
+                message: "Location plugins did not finish activating",
+                service: "plugin",
+              }
+            : { location, data: result?.data ?? [] };
+      const response = HttpClientResponse.fromWeb(
+        request,
+        new Response(JSON.stringify(body), {
+          status: result?.status ?? 200,
+          headers: {
+            "content-type":
+              url.pathname === "/api/event" ? "text/event-stream" : "application/json",
+          },
+        }),
+      );
+      // Keep response consumption on the TestClock scheduler instead of Web stream promises.
+      Object.defineProperties(response, {
+        json: { value: Effect.succeed(body) },
+        text: { value: Effect.succeed(JSON.stringify(body)) },
+        ...(url.pathname === "/api/event" ? { stream: { value: events } } : {}),
+      });
+      return response;
+    }),
+  );
+
 it.layer(layer)("OpenCodeDriver runtime selection", (it) => {
   it.effect("never starts a 1.x server for an OpenCode 2 instance", () =>
     Effect.gen(function* () {
@@ -91,284 +146,109 @@ it.layer(layer)("OpenCodeDriver runtime selection", (it) => {
   );
 
   it.effect(
-    "uses external model events for catalog readiness and keeps cached models without them",
+    "refreshes a warm external catalog without event replay and clears removed models",
     () =>
       Effect.gen(function* () {
-        const host = yield* ProviderHost.ProviderHost;
-        const secondModelRead = yield* Deferred.make<void>();
-        const requestedPaths: Array<string> = [];
-        let modelListReads = 0;
-        let eventSubscriptions = 0;
-        let integrationListReads = 0;
-        const firstModel = {
-          id: "big-pickle",
-          modelID: "big-pickle",
-          providerID: "opencode",
-          name: "Big Pickle",
-          capabilities: { tools: true, input: ["text"], output: ["text"] },
-          variants: [],
-          time: { released: 0 },
-          cost: [],
-          status: "active",
-          enabled: true,
-          limit: { context: 200_000, output: 32_000 },
-        };
-        const laterModel = {
-          ...firstModel,
-          id: "later-model",
-          modelID: "later-model",
-          name: "Later Model",
-        };
-        const http = HttpClient.make((request) => {
-          const url = new URL(request.url);
-          requestedPaths.push(url.pathname);
-          const location = {
-            directory: url.searchParams.get("location[directory]") ?? "/work",
-          };
-          const json = (body: unknown, status = 200) =>
-            HttpClientResponse.fromWeb(
-              request,
-              new Response(JSON.stringify(body), {
-                status,
-                headers: { "content-type": "application/json" },
-              }),
-            );
-
-          if (url.pathname === "/api/info") {
-            return Effect.succeed(
-              json({ version: "2.0.18", pid: 2393556, urls: [], paths: { tmp: "/tmp/opencode" } }),
-            );
-          }
-          if (url.pathname === "/api/event") {
-            eventSubscriptions += 1;
-            // Only the first subscription sees the update. A warm server that
-            // has already published its catalog will not emit another one, so
-            // later subscriptions stay open and silent.
-            const emitUpdate = eventSubscriptions === 1;
-            const body = new ReadableStream<Uint8Array>({
-              start(controller) {
-                if (emitUpdate) {
-                  const event = {
-                    id: "evt_model-update",
-                    created: 1,
-                    type: "model.updated",
-                    location: { directory: host.paths.cwd },
-                    data: {},
-                  };
-                  controller.enqueue(
-                    new TextEncoder().encode(`data: ${JSON.stringify(event)}\n\n`),
-                  );
-                  controller.close();
-                }
-              },
-            });
-            return Effect.succeed(
-              HttpClientResponse.fromWeb(
-                request,
-                new Response(body, { headers: { "content-type": "text/event-stream" } }),
-              ),
-            );
-          }
-          if (url.pathname === "/api/model") {
-            modelListReads += 1;
-            // The first read is partial, the post-update read is complete, and
-            // every later read repeats the complete catalog.
-            const data = modelListReads === 1 ? [firstModel] : [firstModel, laterModel];
-            const response = json({ location, data });
-            return modelListReads === 2
-              ? Deferred.succeed(secondModelRead, undefined).pipe(Effect.as(response))
-              : Effect.succeed(response);
-          }
-          if (url.pathname === "/api/provider") {
-            return Effect.succeed(json({ location, data: [] }));
-          }
-          if (url.pathname === "/api/integration") {
-            integrationListReads += 1;
-            return Effect.succeed(json({ _tag: "NotFoundError", message: "not recorded" }, 404));
-          }
-          return Effect.succeed(json({ _tag: "NotFoundError", message: "not recorded" }, 404));
-        });
-        const instance = yield* create(
-          { serverUrl: "http://127.0.0.1:4096", serverPassword: "secret" },
-          http,
+        const initialRead = yield* Deferred.make<void>();
+        let models = [catalogModel];
+        const http = catalogServer(
+          Deferred.await(initialRead).pipe(Effect.map(() => ({ data: models }))),
+          Stream.never,
         );
-        const changed = yield* Stream.runHead(instance.snapshot.streamChanges).pipe(
-          Effect.forkChild,
+        const instance = yield* create({ serverUrl: "http://127.0.0.1:4096" }, http);
+        const published = yield* Stream.runHead(instance.snapshot.streamChanges).pipe(
+          Effect.forkChild({ startImmediately: true }),
         );
-        const reread = yield* Deferred.await(secondModelRead).pipe(
-          Effect.timeoutOption("5 seconds"),
-          Effect.map((result) => result._tag === "Some"),
-          Effect.forkChild,
-        );
-        yield* Effect.yieldNow;
-        yield* TestClock.adjust("6 seconds");
-        assert.isTrue(
-          yield* Fiber.join(reread),
-          `model.updated did not trigger a reread: ${requestedPaths}`,
-        );
-
-        const settledOption = yield* Fiber.join(changed);
-        if (settledOption._tag === "None")
-          throw new Error("OpenCode status did not publish a snapshot.");
-        const settled = settledOption.value;
-        assert.strictEqual(settled.status, "ready");
+        yield* Deferred.succeed(initialRead, undefined);
+        yield* TestClock.adjust("40 seconds");
+        assert.isDefined(published.pollUnsafe(), "Warm discovery must finish without event replay");
+        const warm = yield* Fiber.join(published);
+        assert.strictEqual(warm._tag, "Some");
+        if (warm._tag === "None") return;
+        assert.strictEqual(warm.value.status, "ready");
         assert.deepStrictEqual(
-          settled.models.map((model) => model.slug),
-          ["opencode/big-pickle", "opencode/later-model"],
+          warm.value.models.map((model) => model.slug),
+          ["opencode/big-pickle"],
         );
-        assert.strictEqual(integrationListReads, 0);
 
-        // The server already signalled readiness once, so a refresh must settle
-        // immediately instead of waiting out the readiness timeout.
-        const refreshed = yield* instance.snapshot.refresh;
-        assert.strictEqual(refreshed.status, "ready");
-        assert.deepStrictEqual(
-          refreshed.models.map((model) => model.slug),
-          settled.models.map((model) => model.slug),
-        );
-        assert.strictEqual(eventSubscriptions, 2);
-        assert.strictEqual(modelListReads, 3);
-        assert.strictEqual(integrationListReads, 0);
+        models = [];
+        const refreshed = yield* instance.snapshot.refresh.pipe(Effect.forkChild);
+        yield* TestClock.adjust("40 seconds");
+        assert.isDefined(refreshed.pollUnsafe(), "An empty authoritative read must also finish");
+        const empty = yield* Fiber.join(refreshed);
+        assert.deepStrictEqual(empty.models, []);
+        assert.notStrictEqual(empty.status, "error");
       }).pipe(Effect.scoped, Effect.provide(TestClock.layer())),
   );
 
-  it.effect("settles a stable catalog when the event feed ends before any update", () =>
+  it.effect("retries plugin activation after a managed server restarts at the same URL", () =>
     Effect.gen(function* () {
-      let modelReads = 0;
-      const http = HttpClient.make((request) => {
-        const url = new URL(request.url);
-        const location = {
-          directory: url.searchParams.get("location[directory]") ?? "/work",
-        };
-        const json = (body: unknown, status = 200) =>
-          HttpClientResponse.fromWeb(
-            request,
-            new Response(JSON.stringify(body), {
-              status,
-              headers: { "content-type": "application/json" },
-            }),
-          );
-        if (url.pathname === "/api/info") {
-          return Effect.succeed(
-            json({ version: "2.0.18", pid: 2393556, urls: [], paths: { tmp: "/tmp/opencode" } }),
-          );
-        }
-        if (url.pathname === "/api/event") {
-          // A feed that ends at once can never deliver `model.updated`, so the
-          // loader must give up rather than sit on the readiness timeout.
-          const body = new ReadableStream<Uint8Array>({
-            start(controller) {
-              controller.close();
-            },
-          });
-          return Effect.succeed(
-            HttpClientResponse.fromWeb(
-              request,
-              new Response(body, { headers: { "content-type": "text/event-stream" } }),
-            ),
-          );
-        }
-        if (url.pathname === "/api/model") {
-          modelReads += 1;
-          return Effect.succeed(
-            json({
-              location,
-              data: [
-                {
-                  id: "big-pickle",
-                  modelID: "big-pickle",
-                  providerID: "opencode",
-                  name: "Big Pickle",
-                  capabilities: { tools: true, input: ["text"], output: ["text"] },
-                  variants: [],
-                  time: { released: 0 },
-                  cost: [],
-                  status: "active",
-                  enabled: true,
-                  limit: { context: 200_000, output: 32_000 },
-                },
-              ],
-            }),
-          );
-        }
-        if (url.pathname === "/api/provider") {
-          return Effect.succeed(json({ location, data: [] }));
-        }
-        return Effect.succeed(json({ _tag: "NotFoundError", message: "not recorded" }, 404));
-      });
-      const instance = yield* create(
-        { serverUrl: "http://127.0.0.1:4096", serverPassword: "secret" },
-        http,
+      const initialRead = yield* Deferred.make<void>();
+      let starts = 0;
+      let running = true;
+      let unavailable = false;
+      const runtime: OpenCodeRuntime.OpenCodeRuntime["Service"] = {
+        ...openCode2Runtime,
+        runOpenCodeCommand: () =>
+          Effect.succeed({ stdout: "opencode v2.0.28\n", stderr: "", code: 0 }),
+        startOpenCodeServerProcess: (input) =>
+          Effect.gen(function* () {
+            starts += 1;
+            running = true;
+            const url = "http://127.0.0.1:4096";
+            const version = yield* input.verify!(url);
+            return {
+              url,
+              version,
+              isRunning: Effect.sync(() => running),
+              exitCode: Effect.never,
+            };
+          }),
+      };
+      const http = catalogServer(
+        Deferred.await(initialRead).pipe(
+          Effect.map(() => {
+            if (unavailable) {
+              unavailable = false;
+              return { data: [], status: 503 };
+            }
+            return {
+              data:
+                starts === 1
+                  ? [catalogModel]
+                  : [{ ...catalogModel, id: "new-model", modelID: "new-model" }],
+            };
+          }),
+        ),
+        Stream.empty,
       );
-      yield* Effect.yieldNow;
-      const refresh = yield* instance.snapshot.refresh.pipe(Effect.forkChild);
-      yield* Effect.yieldNow;
-      // Far below the 30 second readiness timeout: settling inside this window
-      // proves the abandoned feed did not leave the loader waiting.
-      yield* TestClock.adjust("5 seconds");
+      const instance = yield* create({}, http).pipe(
+        Effect.provideService(OpenCodeRuntime.OpenCodeRuntime, runtime),
+        Effect.provideService(
+          FileSystem.FileSystem,
+          FileSystem.makeNoop({ readFileString: () => Effect.succeed("{}") }),
+        ),
+      );
+      const published = yield* Stream.runHead(instance.snapshot.streamChanges).pipe(
+        Effect.forkChild({ startImmediately: true }),
+      );
+      yield* Deferred.succeed(initialRead, undefined);
+      const warm = yield* Fiber.join(published);
+      assert.strictEqual(warm._tag, "Some");
+      if (warm._tag === "None") return;
+      assert.strictEqual(warm.value.status, "ready");
 
-      const settled = yield* Fiber.join(refresh);
-      // The feed ended, so no event can arrive; the stable-catalog check settles
-      // this instead of waiting out the readiness timeout.
-      assert.strictEqual(settled.status, "ready");
-      assert.deepStrictEqual(
-        settled.models.map((model) => model.slug),
-        ["opencode/big-pickle"],
-      );
-      // One boot probe plus this refresh, each reading twice: an initial read and
-      // a confirming read. A different count means the settle path changed.
-      assert.strictEqual(modelReads % 2, 0);
-      assert.strictEqual(modelReads >= 2, true);
-    }).pipe(Effect.scoped, Effect.provide(TestClock.layer())),
-  );
-
-  it.effect("gives up on an event endpoint that never answers", () =>
-    Effect.gen(function* () {
-      const http = HttpClient.make((request) => {
-        const url = new URL(request.url);
-        const location = {
-          directory: url.searchParams.get("location[directory]") ?? "/work",
-        };
-        const json = (body: unknown, status = 200) =>
-          HttpClientResponse.fromWeb(
-            request,
-            new Response(JSON.stringify(body), {
-              status,
-              headers: { "content-type": "application/json" },
-            }),
-          );
-        if (url.pathname === "/api/info") {
-          return Effect.succeed(
-            json({ version: "2.0.18", pid: 2393556, urls: [], paths: { tmp: "/tmp/opencode" } }),
-          );
-        }
-        if (url.pathname === "/api/event") {
-          // Accepts the request and then stalls before sending response headers,
-          // so the subscription never yields a stream.
-          return Effect.never;
-        }
-        if (url.pathname === "/api/model") {
-          return Effect.succeed(json({ location, data: [] }));
-        }
-        if (url.pathname === "/api/provider") {
-          return Effect.succeed(json({ location, data: [] }));
-        }
-        return Effect.succeed(json({ _tag: "NotFoundError", message: "not recorded" }, 404));
-      });
-      const instance = yield* create(
-        { serverUrl: "http://127.0.0.1:4096", serverPassword: "secret" },
-        http,
-      );
-      yield* Effect.yieldNow;
-      const refresh = yield* instance.snapshot.refresh.pipe(Effect.forkChild);
-      yield* Effect.yieldNow;
+      running = false;
+      unavailable = true;
+      const refreshed = yield* instance.snapshot.refresh.pipe(Effect.forkChild);
       yield* TestClock.adjust("40 seconds");
-
-      const unsettled = yield* Fiber.join(refresh);
-      assert.strictEqual(unsettled.status, "warning");
-      assert.strictEqual(
-        unsettled.message,
-        "OpenCode 2 is running, but it did not list any models yet.",
+      assert.isDefined(refreshed.pollUnsafe(), "Startup retries must be bounded");
+      const recovered = yield* Fiber.join(refreshed);
+      assert.strictEqual(starts, 2);
+      assert.strictEqual(recovered.status, "ready");
+      assert.deepStrictEqual(
+        recovered.models.map((model) => model.slug),
+        ["opencode/new-model"],
       );
     }).pipe(Effect.scoped, Effect.provide(TestClock.layer())),
   );
