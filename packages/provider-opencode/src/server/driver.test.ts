@@ -93,6 +93,7 @@ const catalogModel = {
 const catalogServer = (
   models: Effect.Effect<{ data: Array<typeof catalogModel>; status?: number }>,
   events: Stream.Stream<Uint8Array>,
+  info = { version: "2.0.28" },
 ) =>
   HttpClient.make((request) =>
     Effect.gen(function* () {
@@ -101,7 +102,7 @@ const catalogServer = (
       const result = url.pathname === "/api/model" ? yield* models : undefined;
       const body =
         url.pathname === "/api/info"
-          ? { version: "2.0.28", pid: 2393556, urls: [], paths: { tmp: "/tmp/opencode" } }
+          ? { version: info.version, pid: 2393556, urls: [], paths: { tmp: "/tmp/opencode" } }
           : result?.status === 503
             ? {
                 _tag: "ServiceUnavailableError",
@@ -146,13 +147,21 @@ it.layer(layer)("OpenCodeDriver runtime selection", (it) => {
   );
 
   it.effect(
-    "refreshes a warm external catalog without event replay and clears removed models",
+    "keeps a warm external catalog ready through a stalled refresh and clears removed models",
     () =>
       Effect.gen(function* () {
         const initialRead = yield* Deferred.make<void>();
+        let stalledRead = yield* Deferred.make<void>();
+        let stalled = true;
         let models = [catalogModel];
         const http = catalogServer(
-          Deferred.await(initialRead).pipe(Effect.map(() => ({ data: models }))),
+          Deferred.await(initialRead).pipe(
+            Effect.andThen(() =>
+              stalled
+                ? Deferred.succeed(stalledRead, undefined).pipe(Effect.andThen(Effect.never))
+                : Effect.succeed({ data: models }),
+            ),
+          ),
           Stream.never,
         );
         const instance = yield* create({ serverUrl: "http://127.0.0.1:4096" }, http);
@@ -160,22 +169,114 @@ it.layer(layer)("OpenCodeDriver runtime selection", (it) => {
           Effect.forkChild({ startImmediately: true }),
         );
         yield* Deferred.succeed(initialRead, undefined);
-        yield* TestClock.adjust("40 seconds");
-        assert.isDefined(published.pollUnsafe(), "Warm discovery must finish without event replay");
-        const warm = yield* Fiber.join(published);
-        assert.strictEqual(warm._tag, "Some");
-        if (warm._tag === "None") return;
-        assert.strictEqual(warm.value.status, "ready");
+        yield* Deferred.await(stalledRead);
+        yield* TestClock.adjust("31 seconds");
+        assert.isDefined(published.pollUnsafe(), "Initial discovery must have a deadline");
+        const initial = yield* Fiber.join(published);
+        assert.strictEqual(initial._tag, "Some");
+        if (initial._tag === "None") return;
+        assert.strictEqual(initial.value.status, "warning");
+        assert.deepStrictEqual(initial.value.models, []);
+
+        stalled = false;
+        const loaded = yield* instance.snapshot.refresh.pipe(Effect.forkChild);
+        yield* TestClock.adjust("1 second");
+        assert.isDefined(loaded.pollUnsafe(), "Warm discovery must finish without event replay");
+        const warm = yield* Fiber.join(loaded);
+        assert.strictEqual(warm.status, "ready");
         assert.deepStrictEqual(
-          warm.value.models.map((model) => model.slug),
+          warm.models.map((model) => model.slug),
           ["opencode/big-pickle"],
         );
 
+        stalled = true;
+        stalledRead = yield* Deferred.make<void>();
+        const refreshing = yield* instance.snapshot.refresh.pipe(Effect.forkChild);
+        yield* Deferred.await(stalledRead);
+        yield* TestClock.adjust("31 seconds");
+        assert.isDefined(refreshing.pollUnsafe(), "A stalled refresh must have a deadline");
+        const retained = yield* Fiber.join(refreshing);
+        assert.deepStrictEqual(retained.models, warm.models);
+        assert.strictEqual(retained.status, "ready", "Cached models must remain selectable");
+
+        stalled = false;
         models = [];
         const refreshed = yield* instance.snapshot.refresh.pipe(Effect.forkChild);
         yield* TestClock.adjust("40 seconds");
         assert.isDefined(refreshed.pollUnsafe(), "An empty authoritative read must also finish");
         const empty = yield* Fiber.join(refreshed);
+        assert.deepStrictEqual(empty.models, []);
+        assert.notStrictEqual(empty.status, "error");
+      }).pipe(Effect.scoped, Effect.provide(TestClock.layer())),
+  );
+
+  it.effect(
+    "rechecks catalog readiness when an external server changes version at the same URL",
+    () =>
+      Effect.gen(function* () {
+        const initialRead = yield* Deferred.make<void>();
+        const emptyRead = yield* Deferred.make<void>();
+        const info = { version: "2.0.28" };
+        let models = [catalogModel];
+        let cold = false;
+        const http = catalogServer(
+          Deferred.await(initialRead).pipe(
+            Effect.andThen(() => {
+              if (cold) {
+                cold = false;
+                return Deferred.succeed(emptyRead, undefined).pipe(Effect.as({ data: [] }));
+              }
+              return Effect.succeed({ data: models });
+            }),
+          ),
+          Stream.never,
+          info,
+        );
+        const instance = yield* create({ serverUrl: "http://127.0.0.1:4096" }, http);
+        const published = yield* Stream.runHead(instance.snapshot.streamChanges).pipe(
+          Effect.forkChild({ startImmediately: true }),
+        );
+        yield* Deferred.succeed(initialRead, undefined);
+        const warm = yield* Fiber.join(published);
+        assert.strictEqual(warm._tag, "Some");
+        if (warm._tag === "None") return;
+        assert.strictEqual(warm.value.status, "ready");
+        assert.strictEqual(warm.value.version, "2.0.28");
+
+        info.version = "2.0.26";
+        cold = true;
+        models = [{ ...catalogModel, id: "new-model", modelID: "new-model" }];
+        const refreshing = yield* instance.snapshot.refresh.pipe(Effect.forkChild);
+        yield* Deferred.await(emptyRead);
+        yield* TestClock.adjust("0 millis");
+        assert.deepStrictEqual(
+          (yield* instance.snapshot.getSnapshot).models,
+          warm.value.models,
+          "An older cold empty read must retain the published catalog until models arrive",
+        );
+        yield* TestClock.adjust("250 millis");
+        assert.isDefined(
+          refreshing.pollUnsafe(),
+          "An older cold catalog must retry its empty read",
+        );
+        const recovered = yield* Fiber.join(refreshing);
+        assert.strictEqual(recovered.version, "2.0.26");
+        assert.deepStrictEqual(
+          recovered.models.map((model) => model.slug),
+          ["opencode/new-model"],
+        );
+        assert.strictEqual(recovered.status, "ready");
+
+        info.version = "2.0.28";
+        models = [];
+        const cleared = yield* instance.snapshot.refresh.pipe(Effect.forkChild);
+        yield* TestClock.adjust("1 second");
+        assert.isDefined(
+          cleared.pollUnsafe(),
+          "A modern empty catalog must clear without retrying",
+        );
+        const empty = yield* Fiber.join(cleared);
+        assert.strictEqual(empty.version, "2.0.28");
         assert.deepStrictEqual(empty.models, []);
         assert.notStrictEqual(empty.status, "error");
       }).pipe(Effect.scoped, Effect.provide(TestClock.layer())),
