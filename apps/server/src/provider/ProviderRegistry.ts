@@ -192,11 +192,10 @@ const shouldRetainMissingProviderModels = (provider: ServerProvider): boolean =>
     isAntigravity && provider.status === "warning" && provider.auth.status === "unknown";
   const isPendingInitialProbe =
     provider.enabled && !provider.installed && provider.status === "warning";
-  // OpenCode 2 can be running while its lazy catalog is still empty or partial.
   const isPendingOpenCodeCatalog =
     provider.driver === ProviderDriverKind.make("opencode") &&
     provider.installed &&
-    provider.status === "warning" &&
+    (provider.status === "ready" || provider.status === "warning") &&
     (provider.message === OPENCODE_2_CATALOG_EMPTY_MESSAGE ||
       provider.message === OPENCODE_2_CATALOG_LOADING_MESSAGE);
   const didInstalledProviderProbeFail = provider.installed && provider.status === "error";

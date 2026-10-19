@@ -289,18 +289,17 @@ export const OpenCodeDriver: ProviderDriver<
         ),
       });
       let lastLoadedOpenCode2Models: ReadonlyArray<OpenCode2Model> | undefined;
-      const loadOpenCode2Models = openCode2Server.withConnection(({ client, version }) =>
-        makeOpenCode2ModelLoader(
-          loadOpenCode2Catalog(client, host.paths.cwd),
-          version,
-          lastLoadedOpenCode2Models,
-        ).pipe(
-          Effect.tap((catalog) =>
-            Effect.sync(() => {
-              if (catalog._tag !== "Unsettled") lastLoadedOpenCode2Models = catalog.models;
-            }),
-          ),
-        ),
+      const loadOpenCode2Models = openCode2Server.withConnection(({ client, version, external }) =>
+        Effect.gen(function* () {
+          const catalogVersion = external ? (yield* runtimeProbe.get).version : version;
+          const catalog = yield* makeOpenCode2ModelLoader(
+            loadOpenCode2Catalog(client, host.paths.cwd),
+            catalogVersion,
+            lastLoadedOpenCode2Models,
+          );
+          if (catalog._tag !== "Unsettled") lastLoadedOpenCode2Models = catalog.models;
+          return catalog;
+        }),
       );
       const listOpenCode2Workspace = (cwd: string) =>
         openCode2Server.withConnection(({ client, events }) =>

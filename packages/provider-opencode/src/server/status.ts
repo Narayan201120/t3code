@@ -580,7 +580,7 @@ const checkOpenCode2 = Effect.fn("checkOpenCode2")(function* (
     probe:
       result.value._tag === "Unsettled"
         ? probe(
-            "warning",
+            listedModels.length > 0 ? "ready" : "warning",
             listedModels.length > 0
               ? OPENCODE_2_CATALOG_LOADING_MESSAGE
               : OPENCODE_2_CATALOG_EMPTY_MESSAGE,

@@ -20,8 +20,6 @@ export const loadOpenCode2Catalog = (
   return Effect.all(
     {
       models: client.model.list({ location }).pipe(
-        // Plugin activation is the only retryable API failure. The loader bounds
-        // the whole read, including retries, so repeated 503s cannot hang refresh.
         Effect.retry({
           times: 5,
           while: (error) => error._tag === "ServiceUnavailableError" && error.service === "plugin",

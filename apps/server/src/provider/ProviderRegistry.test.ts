@@ -1142,6 +1142,8 @@ it.layer(
       } satisfies ServerProvider;
       const unsettledPartialCatalog = {
         ...unsettledEmptyCatalog,
+        status: "ready",
+        auth: { status: "authenticated" },
         checkedAt: "2026-07-17T00:07:00.000Z",
         models: [
           {
