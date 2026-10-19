@@ -751,31 +751,13 @@ export const layer = Layer.effect(
             .filter((instanceId) => previousSubs.has(instanceId)),
         );
         if (rebuiltInstanceIds.size > 0) {
-          // A rebuild keeps the instance id, so its models may come from a
-          // different server than the ones being carried over. Retention can only
-          // hold them while it still knows which server listed them.
-          const repointedInstanceIds = new Set(
-            newlyAdded
-              .filter(([instanceId]) => rebuiltInstanceIds.has(instanceId))
-              .filter(([instanceId, instance]) => {
-                const previousSource = previousSubs.get(instanceId)?.modelSourceIdentity;
-                return (
-                  previousSource !== undefined &&
-                  instance.modelSourceIdentity !== undefined &&
-                  previousSource !== instance.modelSourceIdentity
-                );
-              })
-              .map(([instanceId]) => instanceId),
-          );
           const [previousProviders, providers] = yield* Ref.modify(
             providersRef,
             (previousProviders) => {
               const providers = previousProviders.map((provider) => {
                 if (!rebuiltInstanceIds.has(provider.instanceId)) return provider;
                 const { workspaceSnapshots: _workspaceSnapshots, ...machineSnapshot } = provider;
-                return repointedInstanceIds.has(provider.instanceId)
-                  ? { ...machineSnapshot, models: [] }
-                  : machineSnapshot;
+                return machineSnapshot;
               });
               return [[previousProviders, providers] as const, providers];
             },

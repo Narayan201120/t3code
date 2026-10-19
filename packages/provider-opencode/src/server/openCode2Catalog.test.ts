@@ -1,4 +1,5 @@
 import { assert, it } from "@effect/vitest";
+import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
@@ -131,5 +132,49 @@ describe("loadOpenCode2Catalog", () => {
       assert.strictEqual(error.operation, "model.list");
       assert.match(error.detail, /could not list its models/i);
     }),
+  );
+
+  it.effect("retries only plugin-activation failures and preserves the final cause", () =>
+    Effect.gen(function* () {
+      for (const failure of [
+        { _tag: "UnauthorizedError", status: 401 },
+        { _tag: "ServiceUnavailableError", status: 503, service: "other" },
+        { _tag: "ServiceUnavailableError", status: 503, service: "plugin" },
+      ]) {
+        const requested = yield* Deferred.make<void>();
+        let reads = 0;
+        const http = HttpClient.make((request) => {
+          if (new URL(request.url).pathname === "/api/model") reads += 1;
+          const body = { ...failure, message: "unavailable" };
+          const response = HttpClientResponse.fromWeb(
+            request,
+            Response.json(body, { status: failure.status }),
+          );
+          Object.defineProperty(response, "json", { value: Effect.succeed(body) });
+          return Deferred.succeed(requested, undefined).pipe(Effect.as(response));
+        });
+        const reading = yield* Effect.gen(function* () {
+          const opencode = yield* OpenCode2Client.OpenCode2Client;
+          const { client } = yield* opencode.connect({
+            baseUrl: "http://127.0.0.1:4096",
+            password: "secret",
+          });
+          return yield* loadOpenCode2Catalog(client, "/project");
+        }).pipe(
+          Effect.provide(
+            OpenCode2Client.layer.pipe(Layer.provide(Layer.succeed(HttpClient.HttpClient, http))),
+          ),
+          Effect.flip,
+          Effect.forkChild,
+        );
+        yield* Deferred.await(requested);
+        yield* TestClock.adjust("2 seconds");
+        assert.isDefined(reading.pollUnsafe(), "Retries must stop");
+        const error = yield* Fiber.join(reading);
+        assert.strictEqual(reads, failure.service === "plugin" ? 6 : 1);
+        assert.strictEqual(error.operation, "model.list");
+        assert.deepInclude(error.cause, { _tag: failure._tag });
+      }
+    }).pipe(Effect.provide(TestClock.layer())),
   );
 });

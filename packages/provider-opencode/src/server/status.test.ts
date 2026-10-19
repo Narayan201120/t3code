@@ -845,7 +845,7 @@ it.effect("keeps the settled catalog when a model request never completes", () =
     const requested = yield* Deferred.make<void>();
     const load = makeOpenCode2ModelLoader(
       Deferred.succeed(requested, undefined).pipe(Effect.andThen(Effect.never)),
-      { _tag: "Ready" },
+      "2.0.28",
       [bigPickle],
     );
     const fiber = yield* load.pipe(Effect.forkChild);
@@ -853,6 +853,25 @@ it.effect("keeps the settled catalog when a model request never completes", () =
     yield* TestClock.adjust("31 seconds");
     NodeAssert.ok(fiber.pollUnsafe(), "The model request must have a deadline");
     NodeAssert.deepEqual(yield* Fiber.join(fiber), { _tag: "Unsettled", models: [bigPickle] });
+  }).pipe(Effect.provide(TestClock.layer())),
+);
+
+it.effect("keeps older OpenCode 2 discovery as a best-effort first-nonempty read", () =>
+  Effect.gen(function* () {
+    const requested = yield* Deferred.make<void>();
+    const replies: Array<ReadonlyArray<OpenCode2Model>> = [[], [bigPickle]];
+    const load = makeOpenCode2ModelLoader(
+      Deferred.succeed(requested, undefined).pipe(
+        Effect.andThen(Effect.sync(() => replies.shift() ?? [bigPickle])),
+      ),
+      "2.0.26",
+      undefined,
+    );
+    const fiber = yield* load.pipe(Effect.forkChild);
+    yield* Deferred.await(requested);
+    yield* TestClock.adjust("250 millis");
+    NodeAssert.ok(fiber.pollUnsafe());
+    NodeAssert.deepEqual(yield* Fiber.join(fiber), { _tag: "Legacy", models: [bigPickle] });
   }).pipe(Effect.provide(TestClock.layer())),
 );
 

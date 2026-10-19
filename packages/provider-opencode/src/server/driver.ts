@@ -8,9 +8,7 @@ import * as FileSystem from "effect/FileSystem";
 import * as Path from "effect/Path";
 import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
-import * as Sse from "effect/encoding/Sse";
 import * as HttpClient from "effect/http/HttpClient";
-import * as HttpClientError from "effect/http/HttpClientError";
 import * as ChildProcessSpawner from "effect/process/ChildProcessSpawner";
 
 import * as OpenCode2TextGeneration from "./v2/textGeneration.ts";
@@ -30,7 +28,6 @@ import {
   loadOpenCode2Workspace,
   makeOpenCode2ModelLoader,
   makePendingOpenCodeProvider,
-  type OpenCode2CatalogReadiness,
   type OpenCode2Model,
   openCode2CommandsToServerProviderSlashCommands,
   openCode2SkillsToServerProviderSkills,
@@ -70,13 +67,6 @@ import {
 const decodeOpenCodeSettings = Schema.decodeSync(OpenCodeSettings);
 
 const DRIVER_KIND = ProviderDriverKind.make("opencode");
-
-/**
- * How long to wait for `/api/event` to hand back a stream. A server that accepts
- * the connection without answering would otherwise hold a provider refresh open
- * with no deadline at all.
- */
-const OPENCODE_2_EVENT_SUBSCRIBE_TIMEOUT = "10 seconds";
 
 function isOpenCodeNativeCommandPath(commandPath: string): boolean {
   const normalized = normalizeCommandPath(commandPath);
@@ -299,72 +289,18 @@ export const OpenCodeDriver: ProviderDriver<
         ),
       });
       let lastLoadedOpenCode2Models: ReadonlyArray<OpenCode2Model> | undefined;
-      let lastLoadedOpenCode2ServerUrl: string | undefined;
-      // A server publishes `model.updated` once while it builds its catalog. Once
-      // seen for this directory, later reads from that server are complete, so a
-      // refresh must not wait for an event that will never arrive again.
-      let readyOpenCode2ServerUrl: string | undefined;
-      const loadOpenCode2Models = openCode2Server.withConnection(({ client, events, url }) =>
-        Effect.gen(function* () {
-          // Opening `/api/event` is a request the server can stall on before it sends
-          // response headers, so it needs its own deadline. Otherwise no catalog
-          // deadline can start and a refresh waits indefinitely.
-          const eventStream: Option.Option<
-            Stream.Stream<
-              OpenCode2Client.OpenCode2StreamEvent,
-              | HttpClientError.HttpClientError
-              | OpenCode2Client.OpenCode2SilentStreamError
-              | Sse.Retry
-              | Sse.SseError
-            >
-          > = yield* events.pipe(
-            Effect.option,
-            Effect.timeoutOption(OPENCODE_2_EVENT_SUBSCRIBE_TIMEOUT),
-            Effect.map(Option.flatten),
-            Effect.orElseSucceed(() => Option.none()),
-          );
-          const runLoader = (readiness: OpenCode2CatalogReadiness) =>
-            makeOpenCode2ModelLoader(
-              loadOpenCode2Catalog(client, host.paths.cwd),
-              readiness,
-              url === lastLoadedOpenCode2ServerUrl ? lastLoadedOpenCode2Models : undefined,
-            );
-
-          let readiness: OpenCode2CatalogReadiness =
-            url === readyOpenCode2ServerUrl ? { _tag: "Ready" } : { _tag: "Unobservable" };
-          if (eventStream._tag === "Some" && readiness._tag !== "Ready") {
-            // Subscribe before `model.list`; its first response can be empty or partial.
-            const updated = yield* Deferred.make<"Updated" | "Abandoned">();
-            const markReady = Effect.sync(() => {
-              readyOpenCode2ServerUrl = url;
-            });
-            yield* eventStream.value.pipe(
-              Stream.runForEach((event) =>
-                "location" in event &&
-                event.type === "model.updated" &&
-                event.location?.directory === host.paths.cwd
-                  ? Deferred.succeed(updated, "Updated").pipe(
-                      Effect.andThen(markReady),
-                      Effect.asVoid,
-                    )
-                  : Effect.void,
-              ),
-              // A feed that ends or errors can no longer deliver the event, so
-              // release the waiter instead of leaving it on the timeout.
-              Effect.onExit(() => Deferred.succeed(updated, "Abandoned")),
-              Effect.ignore,
-              Effect.forkScoped,
-            );
-            readiness = { _tag: "Await", ready: Deferred.await(updated) };
-          }
-
-          const catalog = yield* runLoader(readiness);
-          if (catalog._tag === "Settled") {
-            lastLoadedOpenCode2Models = catalog.models;
-            lastLoadedOpenCode2ServerUrl = url;
-          }
-          return catalog;
-        }).pipe(Effect.scoped),
+      const loadOpenCode2Models = openCode2Server.withConnection(({ client, version }) =>
+        makeOpenCode2ModelLoader(
+          loadOpenCode2Catalog(client, host.paths.cwd),
+          version,
+          lastLoadedOpenCode2Models,
+        ).pipe(
+          Effect.tap((catalog) =>
+            Effect.sync(() => {
+              if (catalog._tag !== "Unsettled") lastLoadedOpenCode2Models = catalog.models;
+            }),
+          ),
+        ),
       );
       const listOpenCode2Workspace = (cwd: string) =>
         openCode2Server.withConnection(({ client, events }) =>
@@ -542,10 +478,6 @@ export const OpenCodeDriver: ProviderDriver<
         instanceId,
         driverKind: DRIVER_KIND,
         continuationIdentity,
-        // The catalog comes from this endpoint, so a change to it makes the
-        // previous models a different server's catalog rather than a stale copy
-        // of this one.
-        modelSourceIdentity: effectiveConfig.serverUrl.trim(),
         displayName,
         accentColor,
         enabled,

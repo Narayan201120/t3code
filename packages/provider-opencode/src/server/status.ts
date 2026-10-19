@@ -9,6 +9,7 @@ import * as Cause from "effect/Cause";
 import * as Data from "effect/Data";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
+import * as Schedule from "effect/Schedule";
 
 import { createModelCapabilities } from "@t3tools/shared/model";
 import { compareSemverVersions } from "@t3tools/shared/semver";
@@ -397,64 +398,8 @@ function subProviderLabelFor(input: {
 
 export type OpenCode2ModelCatalog =
   | { readonly _tag: "Settled"; readonly models: ReadonlyArray<OpenCode2Model> }
+  | { readonly _tag: "Legacy"; readonly models: ReadonlyArray<OpenCode2Model> }
   | { readonly _tag: "Unsettled"; readonly models: ReadonlyArray<OpenCode2Model> };
-
-/**
- * What the caller knows about the server's catalog when it asks for a read.
- * `Ready` is for a server that already published a catalog, where a fresh read
- * is final and waiting would only stall a warm refresh. `Unobservable` means no
- * readiness signal exists, so the loader falls back to proving the catalog has
- * stopped growing.
- */
-export type OpenCode2CatalogReadiness =
-  | {
-      readonly _tag: "Await";
-      /**
-       * `Updated` once the server published its catalog. `Abandoned` when no
-       * further signal can arrive, which never settles a read on its own.
-       */
-      readonly ready: Effect.Effect<"Updated" | "Abandoned">;
-    }
-  | { readonly _tag: "Ready" }
-  | { readonly _tag: "Unobservable" };
-
-/**
- * Identity of a catalog for settling purposes. Two reads with the same identity
- * describe the same catalog, so a non-empty one that repeats is no longer
- * growing and is safe to publish.
- */
-const modelCatalogIdentity = (models: ReadonlyArray<OpenCode2Model>): string =>
-  models
-    .map(
-      (model) =>
-        `${model.providerID}/${model.id}\0${model.name}\0${model.providerName ?? ""}\0${model.variants
-          .map((variant) => variant.id)
-          .toSorted()
-          .join(",")}`,
-    )
-    .toSorted()
-    .join("\n");
-
-const OPENCODE_2_CATALOG_TIMEOUT = "30 seconds";
-
-/**
- * Settles a non-empty catalog only once a second read proves it stopped
- * growing, and otherwise serves the first read as unsettled. An empty first
- * read has nothing to confirm, so it stays unsettled.
- */
-const settleWhenCatalogStopsGrowing = <E>(
-  initial: ReadonlyArray<OpenCode2Model>,
-  fallback: ReadonlyArray<OpenCode2Model>,
-  list: Effect.Effect<ReadonlyArray<OpenCode2Model>, E>,
-): Effect.Effect<OpenCode2ModelCatalog, E> =>
-  Effect.gen(function* () {
-    if (initial.length === 0) return { _tag: "Unsettled", models: fallback };
-    const confirmed = yield* list.pipe(Effect.timeoutOption(OPENCODE_2_CATALOG_TIMEOUT));
-    if (confirmed._tag === "None") return { _tag: "Unsettled", models: fallback };
-    return modelCatalogIdentity(confirmed.value) === modelCatalogIdentity(initial)
-      ? { _tag: "Settled", models: confirmed.value }
-      : { _tag: "Unsettled", models: fallback };
-  });
 
 export const OPENCODE_2_CATALOG_EMPTY_MESSAGE =
   "OpenCode 2 is running, but it did not list any models yet.";
@@ -462,38 +407,27 @@ export const OPENCODE_2_CATALOG_LOADING_MESSAGE = "OpenCode 2 is still loading i
 
 export const makeOpenCode2ModelLoader = <E>(
   list: Effect.Effect<ReadonlyArray<OpenCode2Model>, E>,
-  readiness: OpenCode2CatalogReadiness,
+  version: string,
   lastLoaded: ReadonlyArray<OpenCode2Model> | undefined,
 ): Effect.Effect<OpenCode2ModelCatalog, E> =>
   Effect.gen(function* () {
-    const initialRead = yield* list.pipe(Effect.timeoutOption(OPENCODE_2_CATALOG_TIMEOUT));
-    if (initialRead._tag === "None") {
+    // 2.0.27 added awaitPlugins to model.list. Earlier releases can return partial
+    // success; keep their first-nonempty fallback without certifying completeness.
+    const authoritative = compareSemverVersions(version, "2.0.27") >= 0;
+    const loaded = yield* (
+      authoritative
+        ? list
+        : list.pipe(
+            Effect.repeat({
+              until: (models) => models.length > 0,
+              schedule: Schedule.spaced("250 millis"),
+            }),
+          )
+    ).pipe(Effect.timeoutOption(authoritative ? "30 seconds" : "5 seconds"));
+    if (loaded._tag === "None") {
       return { _tag: "Unsettled", models: lastLoaded ?? [] };
     }
-    const initial = initialRead.value;
-    const fallback = initial.length > 0 ? initial : (lastLoaded ?? []);
-    // This server already published a catalog, so its read is authoritative even
-    // when empty: keeping the cache would report "still loading" forever and
-    // leave removed models listed until T3 restarted.
-    if (readiness._tag === "Ready") {
-      return { _tag: "Settled", models: initial };
-    }
-    // With no readiness signal, a non-empty catalog that reads the same twice in a
-    // row is no longer being built, so it is safe to publish. A single read
-    // cannot prove that: a cold server serves a growing list.
-    if (readiness._tag === "Unobservable") {
-      return yield* settleWhenCatalogStopsGrowing(initial, fallback, list);
-    }
-    const ready = yield* readiness.ready.pipe(Effect.timeoutOption(OPENCODE_2_CATALOG_TIMEOUT));
-    if (ready._tag === "None" || ready.value === "Abandoned") {
-      // The feed ended before an update, which says nothing about completeness.
-      // Fall back to the same stability check rather than waiting it out.
-      return yield* settleWhenCatalogStopsGrowing(initial, fallback, list);
-    }
-
-    const settledRead = yield* list.pipe(Effect.timeoutOption(OPENCODE_2_CATALOG_TIMEOUT));
-    if (settledRead._tag === "None") return { _tag: "Unsettled", models: fallback };
-    return { _tag: "Settled", models: settledRead.value };
+    return { _tag: authoritative ? "Settled" : "Legacy", models: loaded.value };
   });
 
 export interface OpenCode2Workspace {

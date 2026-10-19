@@ -1,14 +1,11 @@
 import type { OpenCodeClient } from "@opencode/client/effect";
 import * as Effect from "effect/Effect";
 import * as Option from "effect/Option";
+import * as Schedule from "effect/Schedule";
 
 import * as OpenCodeRuntime from "./OpenCodeRuntime.ts";
 import type { OpenCode2Model } from "./status.ts";
 
-/**
- * A server loads its provider list with the rest of its catalog, which takes a couple of seconds
- * on a cold start, and the model loader retries while the catalog is empty anyway.
- */
 const PROVIDER_NAME_TIMEOUT = "3 seconds";
 
 /**
@@ -22,7 +19,15 @@ export const loadOpenCode2Catalog = (
   const location = { directory };
   return Effect.all(
     {
-      models: client.model.list({ location }),
+      models: client.model.list({ location }).pipe(
+        // Plugin activation is the only retryable API failure. The loader bounds
+        // the whole read, including retries, so repeated 503s cannot hang refresh.
+        Effect.retry({
+          times: 5,
+          while: (error) => error._tag === "ServiceUnavailableError" && error.service === "plugin",
+          schedule: Schedule.spaced("250 millis"),
+        }),
+      ),
       providers: client.provider
         .list({ location })
         .pipe(Effect.timeout(PROVIDER_NAME_TIMEOUT), Effect.option),
