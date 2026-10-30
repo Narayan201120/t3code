@@ -261,6 +261,31 @@ it.layer(NodeServices.layer)("SessionStore.layer", (it) => {
       expect((yield* sessions.verify(uncapped.token)).runtimeModeCeiling).toBeUndefined();
     }).pipe(Effect.provide(layerSessionStore())),
   );
+  it.effect("rejects tokens carrying a trailing segment", () =>
+    Effect.gen(function* () {
+      const sessions = yield* SessionStore.SessionStore;
+      const issued = yield* sessions.issue({ subject: "one-time-token" });
+      const ticket = yield* sessions.issueWebSocketToken(issued.sessionId);
+      expect((yield* Effect.flip(sessions.verify(`${issued.token}.extra`)))._tag).toBe(
+        "MalformedSessionTokenError",
+      );
+      expect((yield* Effect.flip(sessions.verify(`${issued.token}.`)))._tag).toBe(
+        "MalformedSessionTokenError",
+      );
+      expect((yield* Effect.flip(sessions.verify(`${issued.token}..extra`)))._tag).toBe(
+        "MalformedSessionTokenError",
+      );
+      expect(
+        (yield* Effect.flip(sessions.verifyWebSocketToken(`${ticket.token}.extra`)))._tag,
+      ).toBe("MalformedWebSocketTokenError");
+      expect((yield* Effect.flip(sessions.verifyWebSocketToken(`${ticket.token}.`)))._tag).toBe(
+        "MalformedWebSocketTokenError",
+      );
+      expect(
+        (yield* Effect.flip(sessions.verifyWebSocketToken(`${ticket.token}..extra`)))._tag,
+      ).toBe("MalformedWebSocketTokenError");
+    }).pipe(Effect.provide(layerSessionStore())),
+  );
   it.effect("keeps recorded scopes unchanged for both token versions", () =>
     Effect.gen(function* () {
       const sessions = yield* SessionStore.SessionStore;
