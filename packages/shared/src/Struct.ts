@@ -9,33 +9,46 @@ export type DeepPartial<T> = T extends readonly (infer U)[]
 /**
  * Drops `__proto__` own keys at every depth, preserving object identity when
  * there is nothing to strip. Assignment through such a key would invoke the
- * prototype setter instead of defining a property.
+ * prototype setter instead of defining a property. Cyclic back-references
+ * resolve to the sanitized clone under construction, never to the original.
  */
 function stripProtoKeys(value: unknown, seen: Map<object, unknown> = new Map()): unknown {
   if (Array.isArray(value)) {
+    const cached = seen.get(value);
+    if (cached !== undefined) return cached;
+    const next: Array<unknown> = [];
+    seen.set(value, next);
     let changed = false;
-    const next = value.map((item) => {
+    for (const item of value) {
       const cleaned = stripProtoKeys(item, seen);
-      changed ||= cleaned !== item;
-      return cleaned;
-    });
-    return changed ? next : value;
+      if (cleaned !== item) changed = true;
+      next.push(cleaned);
+    }
+    if (!changed) {
+      seen.set(value, value);
+      return value;
+    }
+    return next;
   }
   if (!P.isObject(value)) return value;
   const cached = seen.get(value);
   if (cached !== undefined) return cached;
-  seen.set(value, value);
-  let next: Record<string, unknown> | undefined;
-  for (const [key, child] of Object.entries(value)) {
-    const cleaned = stripProtoKeys(child, seen);
-    if (key === "__proto__" || cleaned !== child) {
-      next ??= { ...value };
-      if (key === "__proto__") delete next[key];
-      else next[key] = cleaned;
-    }
-  }
-  if (next === undefined) return value;
+  const next: Record<string, unknown> = {};
   seen.set(value, next);
+  let changed = false;
+  for (const [key, child] of Object.entries(value)) {
+    if (key === "__proto__") {
+      changed = true;
+      continue;
+    }
+    const cleaned = stripProtoKeys(child, seen);
+    if (cleaned !== child) changed = true;
+    next[key] = cleaned;
+  }
+  if (!changed) {
+    seen.set(value, value);
+    return value;
+  }
   return next;
 }
 

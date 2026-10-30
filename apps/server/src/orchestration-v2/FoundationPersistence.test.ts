@@ -1963,9 +1963,10 @@ it.layer(layerTest)("orchestration V2 foundation persistence", (it) => {
       );
       yield* Deferred.await(waiterRegistered);
 
-      // Let the waiter finish its row read while the effect is still pending, so
-      // the cancel below lands while it is already waiting. Async enqueue work
-      // keeps the waiter fiber running; a synchronous spin would starve it.
+      // Padding enqueues keep the waiter running so its row read lands before
+      // the cancel: registration is synchronous and the read dispatches first.
+      // A stronger milestone would need a test-only seam in the service, which
+      // the codebase avoids.
       const paddingCommandId = CommandId.make("command:foundation-settle-on-cancel:padding");
       yield* Effect.forEach(
         Array.from({ length: 100 }, (_, index) => index),
@@ -1992,10 +1993,7 @@ it.layer(layerTest)("orchestration V2 foundation persistence", (it) => {
       yield* Effect.yieldNow;
       assert.isUndefined(waiterFiber.pollUnsafe());
       yield* outbox.signalCancellations(cancelledEffectIds);
-      yield* Effect.yieldNow;
-      const status = waiterFiber.pollUnsafe();
-      yield* Fiber.interrupt(waiterFiber);
-      assert.isDefined(status);
+      yield* Fiber.join(waiterFiber);
     }).pipe(Effect.provide(Layer.fresh(layerEffectOutboxProvided))),
   );
 
